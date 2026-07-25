@@ -130,6 +130,11 @@ giữa các kernel cùng loại. **Chốt điểm: chỉ portal.** Portal không
 
 ## 7. Lever còn mở
 
+> **LUẬT VÀNG (từ mô hình byte/step ở `STRATEGY.md` §1):** decode gần như 100% bandwidth-bound
+> (2.29 GB/step ÷ 0.6 TB/s = 3.82ms ≈ đo 3.8ms). ⇒ **Tối ưu chỉ đáng làm nếu nó DI CHUYỂN ÍT BYTE HƠN.**
+> Giảm FLOP / giảm số launch / fuse op = **0 điểm**, vì GPU đang đứng chờ HBM.
+
+
 1. **`lm_head` đang là BF16 trong `compose-w4a8.yml`** — [`online_w4a8.py`](../image-w4a8/online_w4a8.py)
    `get_quant_method` trả `None` cho mọi thứ không phải `LinearBase`, còn patch FP8 ở
    [`patch_full_fp8.py`](../image-full-fp8/patch_full_fp8.py) chỉ sửa dispatch của *config fp8*
@@ -141,4 +146,56 @@ giữa các kernel cùng loại. **Chốt điểm: chỉ portal.** Portal không
 3. **Đuôi TTFT turn-1.** mean 48ms > p50 45ms + cấu trúc §3 ⇒ nếu turn2+ ≈ 15ms thì turn-1 đang ở
    **~300–350ms, s_ttft ≈ 0 cho 1/6 request**. `bench/ers_harness.py` đã in sẵn `turn1 p50 / turn2+ p50`
    — **chưa ai ghi lại con số này**. Đây là phép đo rẻ nhất còn lại.
-4. Custom CUDA/Triton kernel fuse op hybrid — **hợp lệ** theo luật, nhưng effort lớn.
+4. Custom CUDA/Triton kernel fuse op hybrid — **hợp lệ** theo luật, nhưng theo LUẬT VÀNG ở trên thì
+   **vô ích** (không giảm byte). Kernel chỉ đáng viết trên trục KV.
+
+---
+
+## 8. ĐỌC SOURCE trong image thi đấu `annguyenphanhuu/vllm-w4a8:online-r1` (vllm 0.22.1)
+
+> Docker local đã có đúng image (`afa562d714e1`, khớp digest pin trong `compose-w4a8.yml`) ⇒ đọc source
+> trực tiếp, không cần đoán, không cần thuê GPU:
+> `docker run --rm --entrypoint bash <image> -c 'grep ... /usr/local/lib/python3.12/dist-packages/vllm/...'`
+
+### 8.1 ✅ FA3 tiêu thụ fp8-KV NATIVE — không có dequant pass
+
+`v1/attention/backends/flash_attn.py:753-756` khi `is_quantized_kv_cache()`:
+`key_cache = key_cache.view(fp8_dtype)` — là **`.view()`, KHÔNG copy/dequant** — rồi truyền
+`q_descale/k_descale/v_descale` vào kernel FA3. `supports_kv_cache_dtype` (L183-193) cho `fp8/fp8_e4m3`
+**chỉ khi** `get_flash_attn_version()==3` **và** `is_device_capability_family(90)` ⇒ **đúng trên MiG H200**.
+
+⇒ **Giả thuyết "backend dequant fp8→BF16 nên không tiết kiệm byte" là SAI.** Cơ chế đọc-nửa-byte CÓ SẴN,
+không cần viết kernel Triton. Nguyên nhân regression 59.62 nằm ở chỗ khác — xem 8.3.
+
+`cache_config.calculate_kv_scales` default **False** + đã deprecated ⇒ k/v scale = 1.0 (lấy từ checkpoint
+nếu có). Không phải vấn đề hiệu năng, và khớp với `acc_drop=0` đã đo.
+
+### 8.2 ❌ Cascade / shared-prefix attention TỰ TẮT FULL CUDA GRAPH ⇒ ĐÓNG
+
+`v1/worker/gpu_model_runner.py:3777`:
+```python
+cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+    num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output)
+#   -> invalid_modes={CUDAGraphMode.FULL} if disable_full else None
+```
+Điều kiện gate (`flash_attn.py:1054`) thì workload này **thoả hết**: `common_prefix_len ≥ 256` (ta có ~992),
+`num_reqs ≥ 8` (ta có 27), không alibi/sliding-window; sau đó là một perf model thô so với FlashDecoding.
+
+**Nhưng bật cascade = mất FULL cudagraph.** Đo portal: tắt graph ⇒ tbt 3 → **12ms**. Mà cascade chỉ tiết kiệm
+~0.5ms KV traffic. ⇒ **lỗ nặng. K1 ĐÓNG ở stock vLLM 0.22.1.** Muốn mở phải làm cascade capture được
+full-graph (2 kernel + metadata động) = đúng nghĩa research, không làm trong deadline.
+
+### 8.3 🔍 Nghi phạm mới cho regression fp8-KV (tbt 4, ttft 62, 6 failed)
+
+Model hybrid ⇒ vLLM phải **unify page size** giữa 6 layer GQA và 10 layer ShortConv:
+`v1/core/kv_cache_utils.py:1012` `unify_kv_cache_spec_page_size` — *"unify the page size ... raise
+NotImplementedError if failed"*, L1042 *"Cannot unify by adjusting block_size"*, L1551 *"Unify page size by
+padding layers' page_size to the nearest larger page_size"* (`page_size_padded`).
+
+Đổi KV sang fp8 **làm page của layer attention giảm một nửa** (16×8×64×2×2B = 32KB → 16KB) trong khi page
+conv-state không đổi ⇒ **vLLM có thể đổi `block_size` hoặc pad để unify**. Block size to hơn ⇒ **granularity
+prefix-cache thô hơn** ⇒ turn 2–6 match kém ⇒ **đúng triệu chứng ttft 45→62 mà tbt không giảm**.
+
+**Phép đo quyết định (miễn phí, đọc log boot):** so `block_size` và dòng **`GPU KV cache size: N tokens`**
+giữa run fp8-KV và run baseline. Nếu N **không tăng ~2×** ⇒ unification đã ăn hết phần tiết kiệm.
+Đòn thử: pin `--block-size` tường minh (16 / 32) cùng `--kv-cache-dtype fp8`.

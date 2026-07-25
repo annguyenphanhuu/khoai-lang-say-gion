@@ -25,55 +25,88 @@ TPOT(ms) ≈ [ W_bytes + B × 35MB ] / 0.6 TB/s        (B = batch decode ≈ 27)
 **Fit 3/3 điểm, sai số ~5%.** Mô hình này là công cụ dự báo, không phải giả thuyết.
 Hai điều nó nói ra ngay:
 
-- **KV read ≈ 0.95 GB/step ≈ 45% tổng traffic** — cùng cỡ weight. Roofline cũ ghi "KV 0.2–0.4ms"
+- **KV read ≈ 1.09 GB/step ≈ 48% tổng traffic** — cùng cỡ weight. Roofline cũ ghi "KV 0.2–0.4ms"
   vì tính cho batch 3–15; điểm vận hành thật là batch 27 × ctx ~2900.
 - **`lm_head` trong `compose-w4a8.yml` đang là BF16** (KB §7.1) = 0.27GB thay vì 0.13GB.
 
+### Luật vàng rút ra từ mô hình
+
+> **Kernel/tối ưu chỉ đáng làm nếu nó DI CHUYỂN ÍT BYTE HƠN.**
+> Giảm FLOP, giảm số launch, fuse op ⇒ **đúng bằng 0 điểm** (GPU đang đứng chờ HBM).
+
+Đây là lý do "fuse ShortConv/norm/act" chết — không phải vì op đã ở trong graph, mà vì fuse nhanh hơn
+thì vẫn chờ HBM. Và ngược lại: kernel đọc ít byte thì **ăn tuyến tính**. Hợp lệ theo `README.md` §3
+(`custom CUDA/Triton kernels`, `Fused attention kernels`, `memory layout`).
+
 ---
 
-## 2. Đường tới 80+ — hạ CẢ HAI số hạng byte/step
+## 2. Đường tới 80+ — chỉ có một trục: byte/step
 
-| Bước | Thay đổi | W_bytes | KV | TPOT dự đoán | s_tpot | ERS @ ttft 48 |
-| :-- | :-- | --: | --: | --: | --: | --: |
-| — | hiện tại (`w4a8`) | 0.80 | 0.95 | 3.0 | 0.605 | 65 |
-| **1** | + `lm_head` FP8 (**1 dòng code**) | 0.67 | 0.95 | **2.70** | 0.665 | **~74** |
-| **2** | + KV cache 8-bit chạy THẬT | 0.67 | 0.48 | **1.91** | 0.808 | **~81** |
-| 3 | + cắt đuôi TTFT turn-1 | — | — | — | — | **~84** |
+| Bước | Thay đổi | W | KV | TPOT | ERS @ ttft 48 |
+| :-- | :-- | --: | --: | --: | --: |
+| — | hiện tại (`w4a8`) | 0.80 | 1.09 | 3.15 | 65 |
+| **K3** | `lm_head` FP8 (**1 dòng**) | 0.67 | 1.09 | **2.93** | **~72** |
+| **K2** | + KV 8-bit ăn thật | 0.67 | 0.55 | **2.03** | **~80** |
+| ~~K1~~ | ~~+ shared-prefix attention~~ | 0.67 | 0.32 | ~~1.65~~ | ~~84~~ — **ĐÓNG, KB §8.2** |
 
-**Điểm chốt quan trọng nhất:** kết luận cũ *"80 đòi TTFT ~20ms"* chỉ đúng khi TPOT kẹt ở 2.7ms.
-Nếu TPOT về 1.9ms thì **TTFT 45–50ms hiện tại đã đủ để vượt 80** — TTFT trở lại thành bonus, không phải
-đồng-yêu-cầu. Đây là lý do bước 2 là cửa duy nhất cần mở.
+**TTFT giữ nguyên 48ms suốt bảng — không cần đụng tới nó.** Sai số mô hình ±5%.
 
 **Rủi ro accuracy gần như đã trả xong:** int4 weight đã `acc_drop=0` (W4A8 + BnB-NF4) và fp8-KV cũng
 đã `acc_drop=0` (run 59.62). Cả hai thành phần đều **đã qua Accuracy Gate riêng lẻ**.
+
+### Không đáng viết (đừng mất thời gian)
+
+Fuse ShortConv/norm/act · fused sampling · custom int4 GEMV (CUTLASS đã tối ưu, weight byte đã sàn ở
+int4) · bất cứ thứ gì giảm FLOP hoặc số launch.
 
 ---
 
 ## 3. Việc phải làm (theo thứ tự)
 
-### Bước 1 — `lm_head` FP8 trong online_w4a8 · rẻ nhất, chắc nhất, ~+9 điểm
+### Bước 0 — ĐÃ LÀM (2026-07-25): đọc source trong image → xem KB §8
+
+Docker local có đúng image thi đấu ⇒ đã đọc source, kết quả đổi hẳn ưu tiên:
+
+- ✅ **FA3 tiêu thụ fp8-KV native, không dequant** (KB §8.1) ⇒ **không cần viết kernel Triton cho K2.**
+  Cơ chế đọc-nửa-byte đã có sẵn; vấn đề chỉ là tìm ra cái gì đang chặn phần tiết kiệm.
+- ❌ **Cascade attention tự tắt FULL cudagraph** (KB §8.2) ⇒ đổi 0.5ms KV lấy 9ms launch overhead.
+  **K1 ĐÓNG.**
+- 🔍 Nghi phạm mới cho regression fp8-KV: **hybrid page-size unification đổi `block_size`** ⇒ granularity
+  prefix-cache thô hơn ⇒ ttft 45→62 (KB §8.3). Kiểm bằng log boot, không cần submit.
+
+### K3 — `lm_head` FP8 trong online_w4a8 · rẻ nhất, chắc nhất, ~+7 điểm
 
 Trong [`image-w4a8/online_w4a8.py`](image-w4a8/online_w4a8.py) `get_quant_method` hiện trả `None` cho
 `ParallelLMHead` ⇒ rơi về BF16. Cho nó dùng scheme FP8 (không int4 — lm_head là layer sai số cao nhất,
 và FP8 đã đủ để hạ 268→134MB). Build image mới, pin digest, submit.
 **Gate:** `bench/correctness_diff.py` temp=0 vs golden fp8.
 
-### Bước 2 — KV cache 8-bit: tìm ra vì sao lần trước KHÔNG ăn ⇒ cửa 80
+### K2 — KV 8-bit dequant TRONG REGISTER · lever lớn nhất còn lại (−0.8ms)
 
-`--kv-cache-dtype fp8` trên nền FP8 lẽ ra phải cho TPOT 3.8 → 2.79ms theo mô hình §1. Thực tế
-portal ra **tbt 4 (tệ hơn) + ttft 62 + 6 failed** ⇒ **cơ chế đúng nhưng đường thực thi trong vLLM sai**.
-Giả thuyết cần loại trừ, theo thứ tự rẻ nhất — **đọc source TRONG ĐÚNG image thi đấu, đừng đoán**:
+Lý do `--kv-cache-dtype fp8` ra 59.62 (tbt 4, tệ hơn): nếu backend **dequant fp8 → BF16 vào buffer**
+trước attention thì nó **vẫn đọc đủ byte + thêm một pass**. Kernel phải load `float8e4nv` rồi
+`.to(float32)` **ngay trong vòng lặp flash-decoding**, không materialize gì.
 
-1. Backend attention đang chạy có **tiêu thụ fp8-KV native** hay **dequant về BF16 trước khi attention**?
-   Nếu dequant ⇒ vẫn đọc đủ byte + thêm một pass ⇒ đúng như đã đo. Đây là giả thuyết số 1.
-2. Trên model **hybrid**, `kv_cache_dtype` có áp cho cả 6 layer GQA không, hay bị bỏ qua/ép fallback?
+FA3 native fp8-KV đã sẵn (KB §8.1) ⇒ **không phải viết kernel**, chỉ phải gỡ cái đang chặn.
+Thứ tự rẻ → đắt:
+
+1. **Đọc log boot** của run fp8-KV cũ: `block_size` + `GPU KV cache size: N tokens`.
+   N không tăng ~2× ⇒ page-size unification ăn hết (KB §8.3). **Miễn phí, làm trước.**
+2. `--kv-cache-dtype fp8` + **pin `--block-size` tường minh** (16, rồi 32) để chặn unification đổi block.
 3. `fp8_e4m3` vs `fp8_e5m2` vs **int8** (luật cho phép cả INT8) — khác kernel, khác đường code.
-4. Thử lại trên base **v0.25.1** (`image-fullfp8-v0251/`) — FlashAttention + fp8-KV support mới hơn v0.22.1.
+4. Base **v0.25.1** (`image-fullfp8-v0251/`) — support mới hơn v0.22.1.
+5. Chỉ khi 1–4 chứng minh FA3 fp8 kernel *thật sự* chậm ở `head_dim=64`: viết/patch decode kernel Triton
+   load `tl.float8e4nv` in-register. Đệm rất rộng — FA BF16 đọc 1.09GB = 1.8ms; Triton fp8 đọc 0.55GB,
+   kể cả chỉ đạt **70% hiệu suất** vẫn ra 1.3ms ⇒ vẫn thắng. Không cần kernel giỏi, chỉ cần đọc ít byte.
 
-Nếu backend hiện tại không đọc fp8-KV native thì lối ra là chọn/patch backend decode có hỗ trợ.
-Phần thưởng −0.8ms là lớn nhất còn lại trên bàn ⇒ đáng dồn hết thời gian còn lại vào đây.
+**Bonus:** KV 8-bit ⇒ pool KV gấp đôi ⇒ prefix cache giữ nhiều block hơn ⇒ TTFT cũng tốt hơn.
 
-**Bonus miễn phí:** KV 8-bit ⇒ pool KV gấp đôi ⇒ prefix cache giữ được nhiều block hơn ⇒ TTFT cũng tốt hơn.
+### ~~K1 — Shared-prefix / cascade attention~~ · ĐÓNG (KB §8.2)
+
+Cơ chế đúng và workload thoả hết điều kiện gate (`common_prefix_len` ~992 ≥ 256, `num_reqs` 27 ≥ 8):
+27 sequence đang đọc lặp cùng 1000 token prefix = 324 MB/step để đọc 12 MB dữ liệu thật = **34% KV traffic**.
+Nhưng `gpu_model_runner.py:3777` đặt `disable_full=use_cascade_attn` ⇒ bật cascade là **mất FULL cudagraph**,
+đổi 0.5ms lấy 9ms. Chỉ mở lại được nếu làm cascade capture full-graph = research, ngoài deadline.
 
 ### Bước 3 — Đuôi TTFT turn-1 (lossless, +2→5)
 
