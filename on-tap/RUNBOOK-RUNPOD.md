@@ -34,7 +34,7 @@ docker --version && docker info | grep -i runtime   # cần nvidia runtime; nế
 ### 0.3 Lấy code (bench scripts) lên pod
 Cách A — clone GitHub (nếu bench đã push):
 ```bash
-cd /workspace && git clone https://github.com/GenTpham/khoai-lang-say-gion.git repo && ls repo/bench
+cd /workspace && git clone https://github.com/annguyenphanhuu/khoai-lang-say-gion.git repo && ls repo/bench
 ```
 Cách B — upload từ máy Windows (nếu chưa push, chạy TRÊN MÁY BẠN, PowerShell):
 ```bash

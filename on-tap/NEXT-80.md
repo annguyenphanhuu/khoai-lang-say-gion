@@ -23,6 +23,17 @@
 ## 3. Kế hoạch (ranked, mỗi bước có gate)
 
 ### Bước 0 — CỔNG viability: hybrid + spec rollback đúng không (làm ĐẦU TIÊN)
+> ❌ **ĐÃ CHẠY 2026-07-25 (pod H100 #2) → FAIL → ĐÓNG.** Kết quả isolate sạch:
+> - ngram spec boot OK nhưng `correctness_diff` (temp=0) **FAIL 12/12**, token-duplication.
+> - determinism-check (cùng config back-to-back) = **PASS** ⇒ cổng hợp lệ, không phải nhiễu.
+> - `--mamba-cache-mode all`: bị loại trừ với `--enable-prefix-caching` (tụt `align`, không rollback);
+>   khi tắt prefix-cache để `all` bật thật → mamba SSM-state được rollback nhưng **ShortConv conv_state KHÔNG**
+>   (source: `mamba_utils.preprocess_mamba_all_specdec`/`postprocess_mamba_align_gpu` chỉ đụng mamba state;
+>   `short_conv.py` update conv_state qua `state_indices_tensor_p`, không có nhánh rollback theo num_accepted).
+> - ⇒ Bug nằm ở **target-state**, KHÔNG phụ thuộc proposer ⇒ **EAGLE (Bước 2) cũng dính** ⇒ đóng cả hướng
+>   spec ở tầng config. Chỉ mở lại nếu chịu **patch source** (snapshot/restore ShortConv conv_state theo
+>   num_accepted + rebuild image) — rủi ro cao, cộng no-prefix-cache đánh đổi TTFT. Khuyến nghị: chốt rổ ~65.
+
 Bật spec ngram trên vllm 0.25.1, chạy `bench/correctness_diff.py` (temp=0 vs baseline fp8):
 - **PASS** ⇒ conv-state rollback ĐÚNG trên 0.25.1 ⇒ mở đường EAGLE.
 - **FAIL** ⇒ hybrid spec lỗi rollback (đúng lo ngại cũ). Debug: đọc source vllm 0.25.1 v1 spec + mamba state; hoặc chỉ dùng proposer không đụng target-state.

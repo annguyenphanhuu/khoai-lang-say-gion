@@ -4,7 +4,7 @@
 ARG BASE=vllm/vllm-openai:v0.22.1
 FROM ${BASE}
 
-LABEL org.opencontainers.image.source="https://github.com/GenTpham/khoai-lang-say-gion" \
+LABEL org.opencontainers.image.source="https://github.com/annguyenphanhuu/khoai-lang-say-gion" \
       org.opencontainers.image.description="Auditable online FP8 coverage patch for LFM2.5 ShortConv and LM head"
 
 COPY patch_full_fp8.py /opt/perf-patch/patch_full_fp8.py

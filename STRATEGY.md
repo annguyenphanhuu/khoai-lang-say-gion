@@ -13,6 +13,37 @@
 > - **Đường 80+ DUY NHẤT = speculative decoding** (hạ effective-tbt = forward/accepted). Kế hoạch thực thi
 >   chi tiết: **`on-tap/NEXT-80.md`** (n-gram/prompt-lookup → EAGLE-3, gate correctness_diff + acceptance).
 > - Rổ 5 bài an toàn (§4) GIỮ NGUYÊN. Được build image từ **vllm 0.25.1** (luật 3), không khóa fork cũ.
+>
+> ### 🚩 CẬP NHẬT 2026-07-25 (session H100 #2, đo trực tiếp trên pod) — SPEC NGRAM ĐÓNG
+> Đã chạy trọn Bước 0 correctness-gate của NEXT-80 trên pod H100, isolate sạch từng biến:
+> - **ngram spec KHÔNG lossless trên LFM2 hybrid ở vllm 0.25.1** — G0 FAIL 12/12 (temp=0), triệu chứng
+>   token-duplication ("as as", "modes modes"). Đây là **bug rollback conv-state của ShortConv**, KHÔNG phải nhiễu:
+>   determinism-check cùng config back-to-back = PASS ⇒ cổng hợp lệ; spec vs golden cùng-base (chỉ khác spec) = FAIL.
+> - **`--mamba-cache-mode all` KHÔNG cứu được:** (a) nó bị **loại trừ với `--enable-prefix-caching`** (vLLM tự tụt về
+>   `align` ⇒ không cấp buffer rollback); (b) khi tắt prefix-cache để `all` bật thật, mamba SSM-state được rollback
+>   (`preprocess_mamba_all_specdec`/`postprocess_mamba_align_gpu`) **nhưng conv-state của ShortConv thì KHÔNG** →
+>   vẫn corrupt. Ngoài ra base no-prefix-cache tự lệch output vs baseline prefix-cache (prefix-cache hybrid = experimental).
+> - **Hệ quả:** cả ngram LẪN EAGLE (đều verify k-token qua target-forward, dính chung ShortConv conv-state) đóng ở
+>   tầng config. Muốn mở 80+ spec ⇒ **phải patch source vLLM** snapshot/restore ShortConv conv_state theo num_accepted
+>   (kernel + rebuild image, rủi ro cao, + no-prefix-cache đánh đổi TTFT). ⇒ Khuyến nghị: **chốt rổ an toàn ~65 (§4)**.
+
+> ### 🚩 CẬP NHẬT 2026-07-25 (session H100 #3 — ĐO CONCURRENCY THẬT LẦN ĐẦU) — ĐỌC TRƯỚC
+> Mọi bench cũ (`loadgen_c1.py`, `wl_probe.py`) đều **concurrency=1**; portal chấm **70 hội thoại
+> đồng thời Poisson**. Đã viết `bench/ers_harness.py` (harness đồng thời trung thực, chấm ERS bằng
+> đúng công thức từ **histogram server-side vLLM** — miễn artifact client) và đo trên pod H100:
+> - **Calibrate:** baseline fp8+prefix-cache ở RATE=8 (batch decode mean **27**) ⇒ **ERS_HIST 66** ≈
+>   portal 64.67. ⇒ điểm vận hành portal ≈ **batch 27**, KHÔNG phải "3–15" như KB đoán.
+> - **Sweep scheduler — KHÔNG knob nào thắng default:** max-num-batched-tokens {1024..8192}, max-num-seqs 128,
+>   long-prefill-threshold, kv-cache-dtype fp8 → tất cả ≤ baseline (đa số làm TTFT phình 80–88ms).
+>   vLLM v1 default đã tối ưu. ⇒ **giả thuyết "tune scheduling = điểm lossless" BÁC BỎ bằng số đo.**
+> - **PHÁT HIỆN LỚN — TPOT TĂNG theo batch:** batch 8→2.17ms, 16→2.67ms, 27→3.6ms. ⇒ ở batch cao
+>   (điểm portal), decode **KHÔNG thuần weight-bound** mà pha compute + KV-read. **Hệ quả phá 2 hướng "80+":**
+>   (a) **4-bit weight vô dụng** (weight không còn là hạng duy nhất); (b) **speculative decoding vô dụng/hại**
+>   — spec THÊM compute (verify k×batch) vào step đã tải ⇒ TPOT tệ hơn. Cả `NEXT-80.md` lẫn P5 W4A8 dựa trên
+>   giả định batch-thấp/weight-bound ⇒ **sai tiền đề dưới concurrency thật.**
+> - **⇒ Trần config-lossless ~65–66 XÁC NHẬN bằng bằng chứng mạnh.** Đường 75+ KHÔNG nằm ở flag/quant/spec;
+>   chỉ còn = **hạ per-token compute của hybrid ở batch cao** (fuse kernel hoặc đổi stack TensorRT-LLM/SGLang)
+>   — dự án lớn, không phải cấu hình. Bài nộp tốt nhất vẫn là cpu-lean 64.67 / w4a8 65.06.
 
 ---
 
@@ -27,6 +58,7 @@
 | BF16 submission lịch sử | ~50.0 | 0 | — | — | Score đã đo; artifact BF16 hiện cần khôi phục/xác minh |
 | ~~opt80-cudagraph / flashinfer / pure-cudagraph / shortconv~~ | 56–64 | 6–7 | — | — | ❌ ĐÃ XÓA — giả thuyết sai (xem KB §5) |
 | `compose-opt-draft-spec.yml` | **N/A** | boot fail | — | — | ❌ CLOSED — EngineCore init crash (draft hybrid, assert kv-group; KB §5.9) |
+| ngram spec (fp8 + `--speculative-config ngram`) | **N/A** | G0 FAIL | — | — | ❌ CLOSED — boot OK nhưng correctness FAIL 12/12 (ShortConv conv-state rollback bug); `mamba-cache-mode all` không cứu. Session H100 #2 |
 
 ---
 
