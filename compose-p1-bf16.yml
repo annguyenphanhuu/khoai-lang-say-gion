@@ -1,0 +1,76 @@
+# ============================================================================
+# P1 PROBE — điểm ĐO B (BF16, ~2.0 byte/param). Cặp với `compose-p1-fp8.yml`.
+#   Đồng thời là P0 BF16-ANCHOR sạch (checkpoint gốc BF16, KHÔNG pre-quant).
+# ============================================================================
+#
+# CÂU HỎI CHỐT: TPOT (decode) có còn bị chặn bởi BĂNG THÔNG ĐỌC WEIGHT không?
+#   → Nếu CÓ ⇒ giảm byte/param (W4A8, P5) sẽ hạ TPOT ⇒ ĐÁNG build.
+#   → Nếu KHÔNG ⇒ decode đang core-saturated/compute-bound ⇒ W4A8 VÔ ÍCH ⇒ đừng build.
+#
+# THIẾT KẾ 1 BIẾN: file này = Y HỆT `compose-p1-fp8.yml` NHƯNG BỎ dòng `--quantization=fp8`.
+#   Cùng image ⇒ patch full-fp8 nằm IM khi không có cờ (patch chỉ cắm quant_config vào
+#   ShortConv/LM-head khi fp8 bật) ⇒ toàn model load BF16 THUẦN. Không đổi image, không đổi
+#   flag nào khác. KV cache = BF16 ở CẢ HAI (không set --kv-cache-dtype) ⇒ ΔTBT cô lập ĐÚNG
+#   phần byte của WEIGHT = đúng thứ W4A8 thay đổi. FP8-vs-BF16 ở decode (GEMV batch nhỏ) khác
+#   biệt gần như THUẦN băng thông (compute không đáng kể) ⇒ đây là probe bandwidth sạch.
+#
+# ---------------------------------------------------------------------------
+# ĐỌC KẾT QUẢ (chỉ nhìn TBT median = TPOT; BỎ QUA TTFT/ERS của bản BF16 này):
+#   Đặt  T8 = TBT(compose-p1-fp8.yml),  T16 = TBT(compose-p1-bf16.yml).
+#   Mô hình:  TPOT(b) = c0 + k·b   (b = byte/param;  k = hệ số weight-streaming).
+#     k  = T16 − T8            (dốc mỗi byte/param)
+#   Dự đoán W4A8 (b≈0.5):
+#     ┌──────────────────────────────────────────────┐
+#     │  T_W4A8  ≈  1.5·T8  −  0.5·T16                 │
+#     └──────────────────────────────────────────────┘
+#   (nếu T8≈3.8 ⇒ T_W4A8 ≈ 5.7 − 0.5·T16)
+#
+# PHÂN NHÁNH A/B + GO/NO-GO:
+#   • (A) WEIGHT-BANDWIDTH-BOUND  ⇔  T16 − T8 lớn (FP8 tiết kiệm ≥ ~1.5ms so BF16).
+#         → có headroom băng thông thật. Nếu T_W4A8 dự đoán ≤ ~3.0ms  ⇒ **GO build W4A8**.
+#         (với T8≈3.8, ngưỡng GO ⇔ T16 ≥ ~5.4ms.)
+#   • (B) KHÔNG weight-bound       ⇔  T16 ≈ T8 (Δ ≤ ~0.4ms).
+#         → giảm byte weight không hạ TPOT  ⇒ **NO-GO**. Chuyển sang cắt input-path CPU (P3).
+#   • KHOẢNG GIỮA (T_W4A8 dự đoán 3.0–3.5ms) = MARGINAL: chỉ GO nếu chắc chắn có kernel
+#         W4A8 fused/preshuffled native Hopper.
+#
+# ⚠️ CAVEAT BẮT BUỘC (đừng bỏ qua):
+#   1. Công thức là UPPER-BOUND lạc quan: nó BỎ QUA chi phí DEQUANT mỗi token của W4A8
+#      (giải nén 4-bit→8-bit + scale). Đây ĐÚNG là thứ đã giết W4A16 (portal TBT 6ms > FP8
+#      3.8ms — hạ xuống 4-bit lại LÀM CHẬM). ⇒ probe này là ĐIỀU KIỆN CẦN (có headroom băng
+#      thông?), KHÔNG đủ. Điều kiện ĐỦ = kernel W4A8 fused Hopper giữ được prefill FP8-fast
+#      (P5). Không có kernel đó thì kể cả nhánh (A) cũng đừng build.
+#   2. Cross-check dữ liệu cũ: cpu-lean vs full-fp8 có TBT median = 3.8ms Ở CẢ HAI ⇒ vệ sinh
+#      CPU KHÔNG dịch median ⇒ bằng chứng yếu NGHIÊNG (A) (median không core-saturated).
+services:
+  model:
+    image: annguyenphanhuu/vllm-fastsse:fullfp8-20260721-r1@sha256:32273a6e86725f9efb241c715cfd3b4bd202665380d72ce8e09c5810f74cc4da
+    entrypoint:
+      - python3 #Don't change this to vllm-server
+      - -m #Don't change this to vllm-server
+      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
+    command:
+      - --model=/model #Don't change this to vllm-server
+      - --served-model-name=LFM2.5-1.2B-Instruct #Don't change this to vllm-server
+      - --host=0.0.0.0 #Don't change this to vllm-server
+      - --port=8000 #Don't change this to vllm-server
+      - --max-model-len=32768
+      - --gpu-memory-utilization=0.95
+      # <<< BIẾN DUY NHẤT: dòng `--quantization=fp8` bị BỎ ⇒ weight load BF16 thuần.
+      - --tensor-parallel-size=1
+      - --enable-prefix-caching
+      - --disable-log-stats
+    environment:
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - VLLM_LOGGING_LEVEL=WARNING
+    ports:
+      - "8000:8000"
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

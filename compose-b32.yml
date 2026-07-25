@@ -1,0 +1,43 @@
+# W11-B — AN TOÀN: --block-size=32  (liều 2x, cùng trục với W11-A)
+#
+# Vai trò trong vòng này: điểm GIỮA của đường liều-đáp ứng 16 / 32 / 64.
+#   - Nếu điểm tăng đơn điệu theo block size => cơ chế "chi phí host tỉ lệ số block"
+#     là THẬT, và bước sau là đẩy tiếp (128) + tấn công tokenize.
+#   - Nếu cả ba bằng nhau trong nhiễu => trục này chết, đóng dứt điểm bằng MỘT vòng
+#     thay vì ba vòng.
+#
+# Liều 2x nên rủi ro thấp hơn W11-A ở mọi mặt:
+#   - Bỏ phí đuôi prefix cache tối đa 31 token/turn (so với 63 của block64, 15 của block16).
+#   - block-size 32 đã từng chạy sạch trên portal ở kỷ nguyên CŨ (61.69 vs nền 61.62).
+#     LƯU Ý: lần đó đo ở kỷ nguyên TRƯỚC Full-FP8, TTFT 47ms, điểm vận hành khác =>
+#     kết quả cũ KHÔNG kết luận được cho cấu hình hiện tại. Đây là lần đo lại hợp lệ.
+#
+# Không đổi numerics => accuracy_drop phải vẫn = 0.
+services:
+  model:
+    image: annguyenphanhuu/vllm-fastsse:fullfp8-20260721-r1@sha256:32273a6e86725f9efb241c715cfd3b4bd202665380d72ce8e09c5810f74cc4da
+    entrypoint:
+      - python3 #Don't change this to vllm-server
+      - -m #Don't change this to vllm-server
+      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
+    command:
+      - --model=/model #Don't change this to vllm-server
+      - --served-model-name=LFM2.5-1.2B-Instruct #Don't change this to vllm-server
+      - --host=0.0.0.0 #Don't change this to vllm-server
+      - --port=8000 #Don't change this to vllm-server
+      - --max-model-len=32768
+      - --gpu-memory-utilization=0.95
+      - --tensor-parallel-size=1
+      - --enable-prefix-caching
+      - --quantization=fp8
+      - --block-size=32
+    ports:
+      - "8000:8000"
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

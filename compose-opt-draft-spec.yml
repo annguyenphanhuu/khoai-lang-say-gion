@@ -1,0 +1,64 @@
+# CANDIDATE P4 — Draft-model speculative decoding (LFM2.5-230M draft, K=2). ĐƯỜNG DUY NHẤT ~80.
+#
+# ⚠️⚠️ KHÔNG SUBMIT TRƯỚC KHI QUA ĐỦ 6 GATE (cuối file). vLLM KHÔNG có guard rollback ShortConv
+#      state trên target hybrid (verify source: không tìm thấy guard) ⇒ correctness PHẢI test tay.
+#
+# CƠ CHẾ (đường duy nhất có đòn bẩy ~1.8×): draft 230M sinh trước K token → target 1.2B verify
+# 1 forward → nếu accept, amortize 1 lần đọc target-weights qua nhiều output token → TPOT giảm.
+#
+# ĐÃ VERIFY source v0.22.1:
+#   - keys hợp lệ: model/num_speculative_tokens/method/quantization (speculative.py 83/80/86/102).
+#   - --async-scheduling KHÔNG bị chặn với draft_model (vllm.py: error chỉ raise nếu method
+#     ∉ {eagle, ngram-GPU, draft_model}); draft_model được liệt kê là async-compatible.
+#   - draft dùng tokenizer TARGET tự động (speculative.py:668); vocab check pass (cả hai = 65536).
+#
+# gpu-mem-util=0.90 (không 0.95): cần headroom cho draft weights + KV draft + graph của 2 model.
+services:
+  model:
+    image: annguyenphanhuu/vllm-draft-spec:230m-r1@sha256:90b80f722fe10ee774f4fa1427197c2ba585e5ead566fcdf4d40d3def6714e04
+    entrypoint:
+      - python3 #Don't change this to vllm-server
+      - -m #Don't change this to vllm-server
+      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
+    command:
+      - --model=/model #Don't change this to vllm-server
+      - --served-model-name=LFM2.5-1.2B-Instruct #Don't change this to vllm-server
+      - --host=0.0.0.0 #Don't change this to vllm-server
+      - --port=8000 #Don't change this to vllm-server
+      - --max-model-len=32768
+      - --gpu-memory-utilization=0.90
+      - --tensor-parallel-size=1
+      - --enable-prefix-caching
+      - --quantization=fp8
+      - --disable-log-stats
+      - --async-scheduling
+      - '--speculative-config={"method":"draft_model","model":"/draft","num_speculative_tokens":2,"quantization":"fp8"}'
+    environment:
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - VLLM_LOGGING_LEVEL=WARNING
+    ports:
+      - "8000:8000"
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+#
+# ====================== 6 GATE BẮT BUỘC (theo thứ tự, dừng nếu fail) ======================
+# G0 DRY BOOT   : container start sạch, /health 200, log không lỗi speculative/vocab/async.
+# G1 TOKENIZER  : draft dùng tokenizer target (tự động) — xác nhận không warning mismatch.
+# G2 CORRECTNESS: bench/correctness_diff.py greedy temp=0 vs image best 64.67 → PHẢI PASS
+#                 (giống hệt từng token). Lệch ⇒ bug rollback ShortConv ⇒ ĐÓNG candidate.
+# G3 ACCEPTANCE : đọc /metrics vllm:spec_decode_num_accepted_tokens / num_draft_tokens.
+#                 K=2 cần accept-rate ~65-80%+; thấp hơn ⇒ draft cost ăn hết lợi ích.
+# G4 TPOT THỰC  : bench/loadgen_c1.py → TPOT phải ≤2.2ms. Acceptance cao mà TPOT không giảm ⇒ loại.
+# G5 LONG-CTX   : bench/needle32k.sh + multi-turn append-only → không hỏng ở 30K + prefix cache.
+# G6 COMPLIANCE : xác nhận BTC cho phép bundle auxiliary pretrained draft weights (spec decode
+#                 được phép; ghi rõ trong hồ sơ hậu kiểm). Draft = online-FP8, không pre-quant.
+# ---------------------------------------------------------------------------------------
+# THỨ TỰ: 230M K=2 (rẻ nhất) → nếu accept thấp thử 350M K=2 → K=3 CHỈ khi K=2 accept tốt
+#         nhưng chưa đủ amortize. KHÔNG bắt đầu K≥4.

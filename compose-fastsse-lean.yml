@@ -1,0 +1,57 @@
+# WAVE7-B — BÀI CHÍNH: image MỚI (63.38 + fast-path serialize SSE) + đúng flag-stack của A.
+# Biến DUY NHẤT so với WAVE7-A = image.
+#
+# BẰNG CHỨNG (py-spy trên chính stack này, `--cpus 3`, 24 stream đồng thời, process
+# API-server, xếp theo leaf-frame — CPU thực, không tính idle event-loop):
+#   47  pydantic model_dump_json      <-- LỚN NHẤT (~27% công việc frontend)
+#   31  transformers _encode_plus     <-- đã đánh bằng --renderer-num-workers=3
+#   22  detokenizer _protected_step   (đã là đường Rust DecodeStream, không cắt được)
+#   20  vllm/v1/metrics/stats.py      <-- đã đánh bằng --disable-log-stats
+#   18  starlette stream_response · 15 uvicorn send  (transport, không cắt được)
+#   14  __log_extra_fields__ (pydantic validator)  <-- BIẾN MẤT theo fast-path
+#   10  pydantic __init__                          <-- BIẾN MẤT theo fast-path
+# ⇒ patch này nhắm ĐÚNG leaf lớn nhất còn lại: bỏ hẳn dựng+serialize pydantic cho mỗi
+# token, thay bằng string template.
+#
+# ĐÚNG ĐẮN: build FAIL nếu frame lệch 1 byte so với
+# `ChatCompletionStreamResponse(...).model_dump_json(exclude_unset=True)`.
+# Build log: **"verify_fastsse OK: 132 cases byte-identical"**. Request có
+# tool/reasoning/logprobs/usage/log-outputs đi NGUYÊN code gốc.
+# KHÔNG đệm, KHÔNG gộp chunk, KHÔNG đổi thời điểm phát token ⇒ không đụng sổ đen #1.
+#
+# Dự phóng: nếu frontend ≈ 40% của 3.47ms CPU/step thì cắt ~1/3 frontend ≈ −0.4ms TPOT
+# ⇒ **+3đ** trên nền A ⇒ ~68. FALSIFY: = A ⇒ pydantic không nằm trên critical path
+# portal (khác profile local) ⇒ đóng hướng frontend, chuyển sang EngineCore.
+services:
+  model:
+    image: annguyenphanhuu/vllm-cpulean:fastsse-r1@sha256:6f8edb0c975307c5caae2ca7cf88acb581ec95d770a44c384587fd654e65e9ee
+    entrypoint:
+      - python3 #Don't change this to vllm-server
+      - -m #Don't change this to vllm-server
+      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
+    command:
+      - --model=/model #Don't change this to vllm-server
+      - --served-model-name=LFM2.5-1.2B-Instruct #Don't change this to vllm-server
+      - --host=0.0.0.0 #Don't change this to vllm-server
+      - --port=8000 #Don't change this to vllm-server
+      - --max-model-len=32768
+      - --gpu-memory-utilization=0.95
+      - --tensor-parallel-size=1
+      - --enable-prefix-caching
+      - --quantization=fp8
+      - --disable-log-stats
+      - --renderer-num-workers=3
+    environment:
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - VLLM_LOGGING_LEVEL=WARNING
+    ports:
+      - "8000:8000"
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

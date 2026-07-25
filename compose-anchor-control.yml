@@ -1,0 +1,37 @@
+# W11-C — CONTROL cùng ngày (neo 63.4, KHÔNG có delta nào)
+#
+# Giống HỆT compose-full-fp8.yml. Vì sao vẫn tiêu 1 slot cho nó:
+#   σ portal = 0.65 nhưng TẤT CẢ so sánh của đội tới giờ đều là CHÉO NGÀY. "Thời tiết
+#   máy chấm" (noisy neighbor) là nguồn nhiễu lớn nhất và nó tương quan theo thời điểm.
+#   Nộp control SÁT GIỜ với W11-A/B biến ba lượt rời rạc thành một phép so sánh CẶP:
+#   Δ(b64 − control) và Δ(b32 − control) đo được ngay cả khi hôm đó máy chấm chậm/nhanh.
+#   Không có control thì một kết quả 64.5 hay 61.5 đều KHÔNG kết luận được gì.
+#
+# Đây cũng là bài dự phòng cho rổ 5 (cơ chế sạch nhất, accuracy_drop = 0).
+services:
+  model:
+    image: annguyenphanhuu/vllm-fastsse:fullfp8-20260721-r1@sha256:32273a6e86725f9efb241c715cfd3b4bd202665380d72ce8e09c5810f74cc4da
+    entrypoint:
+      - python3 #Don't change this to vllm-server
+      - -m #Don't change this to vllm-server
+      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
+    command:
+      - --model=/model #Don't change this to vllm-server
+      - --served-model-name=LFM2.5-1.2B-Instruct #Don't change this to vllm-server
+      - --host=0.0.0.0 #Don't change this to vllm-server
+      - --port=8000 #Don't change this to vllm-server
+      - --max-model-len=32768
+      - --gpu-memory-utilization=0.95
+      - --tensor-parallel-size=1
+      - --enable-prefix-caching
+      - --quantization=fp8
+    ports:
+      - "8000:8000"
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

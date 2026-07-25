@@ -1,0 +1,61 @@
+# WAVE10 — cùng patch Full-FP8, ĐỔI ENGINE v0.22.1 → v0.25.1. Biến DUY NHẤT = version vLLM.
+#
+# ============ VÌ SAO ĐÂY LÀ CÚ ĐÁNH ĐÚNG (không phải gamble ngẫu nhiên) ============
+# W9 (cpustep = 54.34) đã CHỨNG MINH bằng số: cắt CPU của _prepare_inputs KHÔNG giúp gì
+# và còn hại TTFT. Lý do (đọc source): copy_to_gpu / mamba_get_block_table_tensor /
+# _prepare_inputs đều nằm trong PHA PREPARE — pha mà async scheduling ĐÃ overlap với GPU
+# forward. Cắt cái đã bị max() che = 0 (đúng như local: client-TBT 14.56ms không đổi).
+#
+# ⇒ Phân rã đúng: TPOT = max(prepare_CPU 1.66ms [đã che], execute_critical 3.61ms).
+#   execute_critical = GPU_forward (~0.6ms) + post-GPU CPU (sample→output→IPC→detok, ~3ms
+#   TRẢI PHẲNG trên 2 process, KHÔNG tập trung ở hàm nào — top-12 leaf chỉ 35%).
+# Không cờ, không patch cục bộ nào cắt được 3ms phẳng đó. Thứ DUY NHẤT cắt được = một
+# ENGINE LOOP KHÁC. Giữa v0.22.1 và v0.25.1, vLLM viết lại nhiều hot-path V1 + async.
+#
+# GIẢ THUYẾT (fit tốt nhất cho một đội 70–80): nếu v0.25.1 che được cả pha post-GPU
+# (hoặc loop nhẹ hơn) ⇒ TPOT tiến về sàn GPU ~1ms ⇒ s_tpot ((10−1)/9)² → ~1.0
+# ⇒ +15..25đ. Đây là structural axis DUY NHẤT còn lại giải thích được khoảng cách tới 70+,
+# và là axis chưa từng test SẠCH (W1-B so stock-vs-patched, đây là same-patch-diff-version).
+#
+# ============ ĐÃ VALIDATE LOCAL (v0.25.1-cu129, đúng image nộp) ============
+# - Boot OK với --quantization=fp8; log xác nhận "Asynchronous scheduling is enabled",
+#   patch Full-FP8 (5 marker) áp đúng, Mamba cache 'align' như baseline.
+# - Hội thoại 6 turn greedy (temp 0, seed cố định, prefix caching, context append-only):
+#   output MẠCH LẠC & ĐÚNG (LSM tree / quorum / write path... trích đúng section).
+#   ⇒ rủi ro Accuracy Gate thấp (nhưng GPQA full chỉ chốt ở hậu kiểm).
+# - Latency THẬT chỉ portal H200 đo được (3050 không chạy fp8) — đây là gap cố hữu, đã
+#   biết, và là lý do bài này là 1 phép thử A/B đơn biến chứ không phải "chắc thắng".
+#
+# ============ ĐỌC KẾT QUẢ ============
+# ≥ 66  : engine mới nhẹ hơn ⇒ version LÀ đòn bẩy ⇒ vòng sau thử version mới hơn nữa + đo TPOT.
+# 63–65 : version trung tính (khớp W1-B) ⇒ đóng axis version, chốt trần stock ~63–65.
+# < 62  : v0.25.1 chậm hơn cho config này ⇒ giữ v0.22.1 làm bài chính.
+#
+# So sánh cặp đúng: đối chiếu với neo 63.4 (= compose-full-fp8.yml, cùng patch, v0.22.1).
+services:
+  model:
+    image: annguyenphanhuu/vllm-fullfp8-v0251:r1@sha256:3c753c5c3c4696ea6efab6249980e262c9ad5ed0b3bbee318d55a829c42da41e
+    entrypoint:
+      - python3 #Don't change this to vllm-server
+      - -m #Don't change this to vllm-server
+      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
+    command:
+      - --model=/model #Don't change this to vllm-server
+      - --served-model-name=LFM2.5-1.2B-Instruct #Don't change this to vllm-server
+      - --host=0.0.0.0 #Don't change this to vllm-server
+      - --port=8000 #Don't change this to vllm-server
+      - --max-model-len=32768
+      - --gpu-memory-utilization=0.95
+      - --tensor-parallel-size=1
+      - --enable-prefix-caching
+      - --quantization=fp8
+    ports:
+      - "8000:8000"
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

@@ -1,0 +1,53 @@
+# ============================================================================
+# CANDIDATE P-legal-1 — FP8 KV cache (1 BIẾN trên nền BEST 64.67 = compose-cpu-lean.yml).
+# ============================================================================
+# BIẾN DUY NHẤT so với compose-cpu-lean.yml = thêm `--kv-cache-dtype=fp8`.
+#
+# CƠ CHẾ: KV của 6 layer attention (GQA, head_dim=64) đang là BF16. FP8 KV → nửa byte đọc KV
+#   mỗi token. Roofline: KV chỉ ~0.2–0.4ms/3.8ms (chỉ 6/16 layer) ⇒ ΔTPOT kỳ vọng NHỎ
+#   (−0.1→−0.2ms, chủ yếu ở context dài). Kernel FP8-KV có sẵn (CUTLASS/FlashAttn), online, hợp lệ.
+#
+# ⚠️⚠️ RỦI RO ACCURACY GATE — ĐỌC KỸ TRƯỚC KHI NỘP:
+#   - FP8 KV là LOSSY ⇒ output SẼ lệch vài token so với BF16-KV. `correctness_diff.py` (exact
+#     match temp=0) gần như CHẮC CHẮN FAIL — nhưng đó là gate TỰ ĐẶT cho spec-decode, KHÔNG
+#     nhất thiết = Accuracy Gate của portal.
+#   - vLLM 0.22.1: FP8-KV KHÔNG có calibration scale trong checkpoint ⇒ dùng scale mặc định/động
+#     ⇒ chất lượng có thể giảm hơn kỳ vọng.
+#   - TÔI KHÔNG boot-test/accuracy-test được local (image CUDA-13 vs driver 12.9). ⇒ **PORTAL
+#     CHÍNH LÀ bài kiểm tra accuracy**. Nếu gate portal là exact-match → bài này FAIL/điểm sập.
+#     Nếu gate là ngưỡng chất lượng → nhiều khả năng PASS.
+#   ⇒ EV: upside NHỎ (+0.8→+1.5 điểm) × rủi ro downside THẬT (fail gate). Chỉ nộp khi có slot dư
+#     và bạn chấp nhận đánh cược. KHÔNG phải bài nộp an toàn — bài an toàn là interactivity.
+services:
+  model:
+    image: annguyenphanhuu/vllm-fastsse:fullfp8-20260721-r1@sha256:32273a6e86725f9efb241c715cfd3b4bd202665380d72ce8e09c5810f74cc4da
+    entrypoint:
+      - python3 #Don't change this to vllm-server
+      - -m #Don't change this to vllm-server
+      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
+    command:
+      - --model=/model #Don't change this to vllm-server
+      - --served-model-name=LFM2.5-1.2B-Instruct #Don't change this to vllm-server
+      - --host=0.0.0.0 #Don't change this to vllm-server
+      - --port=8000 #Don't change this to vllm-server
+      - --max-model-len=32768
+      - --gpu-memory-utilization=0.95
+      - --tensor-parallel-size=1
+      - --enable-prefix-caching
+      - --quantization=fp8
+      - --kv-cache-dtype=fp8        # <<< BIẾN DUY NHẤT so với compose-cpu-lean.yml
+      - --disable-log-stats
+    environment:
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - VLLM_LOGGING_LEVEL=WARNING
+    ports:
+      - "8000:8000"
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
