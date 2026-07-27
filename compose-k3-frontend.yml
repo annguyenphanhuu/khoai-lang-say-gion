@@ -1,0 +1,72 @@
+# ============================================================================
+# K4 = K3 (image y hệt, digest y hệt) + ĐÚNG HAI cờ frontend.  ARM CHÍNH 27/07 chiều.
+# ============================================================================
+# CƠ SỞ: `FINDINGS-2026-07-27-RIG.md`. Đây là đòn ĐẦU TIÊN có quan hệ NHÂN QUẢ đo được,
+# không phải suy đoán từ một run portal nhiễu.
+#
+#   Bóc TTFT bằng histogram server-side (rig, client pin ra khỏi core 0-2):
+#     TTFT 43 ms = queue 0.0 + prefill 19 + frontend 19
+#   Sampler in-process trên API server: việc CPU DUY NHẤT ở frontend là `_encode_plus`
+#   (tokenize lại ~2900 token prompt mỗi turn). SSE + prometheus < 5%.
+#
+#   1) --disable-uvicorn-access-log
+#      VLLM_LOGGING_LEVEL=WARNING **KHÔNG** tắt access log của uvicorn — log server đầy dòng
+#      `INFO: 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 OK`. Mọi bài nộp từ trước
+#      tới nay đều trả giá này trên đúng 3 core đang là nút cổ chai.   Δrest = -2.7 ms.
+#   2) --renderer-num-workers=2
+#      Mặc định là **1** (`vllm/config/model.py:332` TRONG CHÍNH IMAGE NÀY) ⇒ toàn bộ 420 lần
+#      tokenize đi qua một thread duy nhất.   Δrest = -3.5 ms.  Bão hoà ở 2 (chỉ có 3 core).
+#
+#   A/B chốt trên rig, 2 boot mỗi bên, 4 rep ẤM mỗi bên (bỏ rep lạnh đầu mỗi boot):
+#     nền      69.04 · 68.78 · 68.54 · 68.98   -> mean 68.84  sd 0.23   TTFT 43.0
+#     ứng viên 69.89 · 69.83 · 69.79 · 69.61   -> mean 69.78  sd 0.12   TTFT 41.2
+#     ==> Δ = +0.94 ERS, tách bạch hoàn toàn (không chồng lấn).
+#
+# ĐÃ VERIFY OFFLINE trên chính image này (docker, không cần GPU) — KHÔNG có rủi ro boot fail:
+#   digest local == digest pin dưới đây (sha256:2ba9c346...)
+#   cli_args.py:249  `disable_uvicorn_access_log: bool = False`   -> cờ TỒN TẠI, mặc định OFF
+#   config/model.py:332 `renderer_num_workers: int = 1`           -> cờ TỒN TẠI, mặc định 1
+#   ⚠️ `vllm.__version__` trong image trả **0.22.1** nhưng source khớp 0.25.1 gần như từng dòng
+#      (model.py:332 vs 333) ⇒ **đừng tin chuỗi version, chỉ tin grep source trong image.**
+#
+# OUTPUT-PRESERVING: cả hai chỉ đụng logging và số thread của pool tokenize.
+#   Model KHÔNG nhìn thấy ít hơn. Không đụng cudagraph. Không đụng KV/quant/sampling.
+#
+# ĐỌC KẾT QUẢ: so với 68.57 (best-of). Đây là vé số có kỳ vọng cao hơn hẳn K3 trần
+#   (P phá kỷ lục: ~1.1% -> ~16% cho một ngày quota), KHÔNG phải thí nghiệm —
+#   Δ 0.94 nằm dưới ngưỡng phân giải 4 ERS của portal nên **đừng đọc một run rồi kết luận gì**.
+# ============================================================================
+services:
+  model:
+    image: annguyenphanhuu/vllm-w4a8:online-r3@sha256:2ba9c346bd48c2c6e3084769b2697f6eed753687127d26ef299deadb95677703
+    entrypoint:
+      - python3 #Don't change this to vllm-server
+      - -m #Don't change this to vllm-server
+      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
+    command:
+      - --model=/model #Don't change this to vllm-server
+      - --served-model-name=LFM2.5-1.2B-Instruct #Don't change this to vllm-server
+      - --host=0.0.0.0 #Don't change this to vllm-server
+      - --port=8000 #Don't change this to vllm-server
+      - --max-model-len=32768
+      - --gpu-memory-utilization=0.90
+      - --tensor-parallel-size=1
+      - --enable-prefix-caching
+      - --quantization=online_w4a8   # int4-g128 body + FP8 act + FP8 lm_head (K3)
+      - --disable-log-stats
+      - --disable-uvicorn-access-log   # <<< MỚI: tắt access log uvicorn (-2.7 ms rest)
+      - --renderer-num-workers=2       # <<< MỚI: pool tokenize 1 -> 2 thread (-3.5 ms rest)
+    environment:
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - VLLM_LOGGING_LEVEL=WARNING
+    ports:
+      - "8000:8000"
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

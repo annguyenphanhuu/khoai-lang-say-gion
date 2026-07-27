@@ -2,7 +2,8 @@
 
 > Số đo: `on-tap/KNOWLEDGE_BASE.md`. Luật: `README.md` (**chỉ vLLM**, **chỉ online quant**).
 > Điểm cao nhất từng thấy **68.57** (K3) — **KHÔNG tái lập được**, xem §1. Hạn 30/07/2026.
-> Cập nhật 2026-07-26 sau 20 submit. Bản này **thay thế** mọi kết luận cũ về nhiễu và về trục KV.
+> Cập nhật **2026-07-27 chiều** (sau ngày rig). Bản này **thay thế** mọi kết luận cũ về nhiễu,
+> về trục KV, và về "sàn = attention" (§2b đã sửa). Số đo rig: `FINDINGS-2026-07-27-RIG.md`.
 
 ---
 
@@ -49,26 +50,32 @@ Con số 1.09 GB KV/step là **phép tính**, không phải phép đo — và n�
 
 ⇒ **Cơ cấu thật: sàn 2.05 (61%) · weight 1.20 (36%) · KV ≤0.44 (≤13%).**
 
-### ✅ 2b. SÀN ĐÃ ĐƯỢC ĐỊNH DANH (nsys 27/07, KB §8) — **sàn = decode attention**
+### 🔴 2b. SÀN = **CPU của EngineCore**, KHÔNG phải attention (sửa 27/07 chiều)
 
-Giả thuyết cũ ("latency × 80–100 kernel") **SAI ở phần cơ chế**: có tới **223 kernel/step**, nhưng
-**gap chỉ 4–7%** ⇒ **không launch-bound**. Đo decode thuần B=27 trên rig (MPS 14% ≈ 18 SM):
+Bản trước kết luận "sàn 2.05 ms = decode attention" từ nsys. **Số nsys đúng, suy luận sai**: nó đo
+tỉ lệ trong *thời gian GPU busy*, không đo GPU chiếm bao nhiêu phần của một step.
+Đo lại bằng ERS harness trên rig, **client pin ra khỏi core 0-2** (mọi số rig cũ nhiễm lỗi này ⇒
+TTFT bị thổi 94 vs 44 ms) — chi tiết `FINDINGS-2026-07-27-RIG.md`:
 
-| | /step | ms/step | % |
-| :-- | --: | --: | --: |
-| **attention** (6 call, `flash_attn_fwd_sm90` hdim64) | 19 | **2.75** | **54%** |
-| gemm | 65 | 1.87 | 37% |
-| elementwise/norm/act | 124 | 0.375 | **7.4%** |
+| Thí nghiệm | Số | Suy ra |
+| :-- | :-- | :-- |
+| `--no-async-scheduling` | TPOT 3.33 → 4.75 | async = `max(CPU,GPU)`, tắt = `CPU+GPU` ⇒ **{3.33, 1.42}** |
+| **MPS 50% (cắt nửa SM)** | TPOT **không đổi** | GPU dư ≥2× ⇒ **3.33 là CPU**, 1.42 là GPU |
+| quét RATE (B = 7.8/15.8/27) | `TPOT ≈ 1.60 + 0.064×B` | intercept = GPU ✓ · slope = **64 µs Python/req/step** |
+| spy `VLLM::EngineCore` | `zero_block_ids` 18% · `copy_to_gpu` 17% · `mamba_get_block_table_tensor` 5% · `collect_mamba_copy_meta` 3% | **43% CPU/step = bookkeeping hybrid LFM2. 0% attention.** |
 
-`t_attn/call = 56 µs + 0.100 µs × ctx`. Quy về portal (hệ số 0.64 lấy từ nhánh weight) ở ctx 3300
-⇒ attention ≈ **1.5 ms ≈ 73% của sàn 2.05**. **1.6 ms ẩn số = attention.** Hết ẩn số.
+⇒ Mục tiêu đúng của trục TPOT là **cắt việc Python mỗi request mỗi step**, không phải thay kernel
+attention. Cắt đôi attention chỉ đáng ~0.2 ms (không phải 0.75).
 
-**KV fp8 trên rig chỉ cắt attention 19%** (không phải 50%) ⇒ attention bị chặn bởi **độ trễ / số
-giao dịch trên ~18 SM**, không phải byte. Đây là **cơ chế** giải thích `k=1.006` của §3.1.
+**Số nsys cũ vẫn giữ giá trị mô tả** (decode thuần B=27, MPS 14% ≈ 18 SM): attention 2.75 ms/step
+= **54% GPU busy** (6 call `flash_attn_fwd_sm90` hdim64) · gemm 37% · elementwise **7.4%** ·
+gap 4–7% ⇒ **không launch-bound**. `t_attn/call = 56 µs + 0.100 µs × ctx`.
+KV fp8 chỉ cắt attention 19% ⇒ attention bị chặn bởi độ trễ/số giao dịch, không phải byte —
+đây vẫn là **cơ chế** giải thích `k=1.006` của §3.1.
 
-⇒ Hệ quả cứng: fusion (≤7.4%), cudagraph-sizes (không launch-bound), KV quant (có cơ chế bác bỏ),
-cascade (mất cudagraph ⇒ eager, §3.2) — **tất cả đều không phải lever**. 80 đòi **kernel attention
-khác cho shape B=27/hdim64/18 SM** = phải build image, không phải cờ CLI.
+⇒ Hệ quả cứng **không đổi**: fusion (≤7.4%), cudagraph-sizes (không launch-bound), KV quant,
+cascade (mất cudagraph ⇒ eager) — **không cái nào là lever**. Cái đổi là **đích ngắm**:
+`zero_block_ids` / `copy_to_gpu` / block-table hybrid, chứ không phải kernel attention.
 
 ## 3. TRỤC ĐÃ ĐÓNG
 
@@ -79,9 +86,11 @@ block_size không bị nhân đôi bởi hợp nhất page hybrid (mamba page LF
 `calculate_kv_scales` bị ép tắt cho hybrid · `.view()` không copy · `_cudagraph_support=ALWAYS`
 không phụ thuộc kv dtype. ⇒ KV đơn giản **không phải bottleneck**. Rút mọi ngân sách khỏi trục này.
 
-**3.2 Các cờ cho ttft/scheduling.** `--renderer-num-workers=2` và `--no-scheduler-reserve-full-isl`:
-cùng ra ttft 55, và cái sau là no-op đã chứng minh (`kv_cache_manager.py:346` reserve theo ISL thật
-~54MB; pool KV ~13 GB dùng 11% ⇒ không bao giờ chặn). `block-size` pin · `gpu-mem 0.95` ·
+**3.2 Các cờ cho ttft/scheduling.** `--no-scheduler-reserve-full-isl` là no-op đã chứng minh
+(`kv_cache_manager.py:346` reserve theo ISL thật ~54MB; pool KV ~13 GB dùng 11% ⇒ không bao giờ chặn).
+⚠️ **`--renderer-num-workers=2` KHÔNG đóng** — nó cùng ra ttft 55 với cái no-op nên hồi 26/07 bị xếp
+nhầm vào đây; rig 27/07 cho thấy nó **thật** (mặc định là 1, Δrest −3.5 ms, xem §2b/§5).
+Đóng thật: `block-size` pin · `gpu-mem 0.95` ·
 `max-num-batched-tokens 2048` · `max-model-len` · `performance-mode` · cascade (22 failed) ·
 FlashInfer · sliding-window (**abort**) · mọi spec decode · custom ShortConv/fuse.
 `--api-server-count` **no-op** trên entrypoint bị ép; Rust frontend **không có** trong image.
@@ -100,39 +109,43 @@ FlashInfer · sliding-window (**abort**) · mọi spec decode · custom ShortCon
 TPOT hiện tại **3.25**. ⇒ **Trần tuyệt đối của kiến trúc hiện nay là 77.0** (ttft về sàn 10 ms).
 
 - **75 khả thi**: chỉ cần ttft 54 → ~20 ms, TPOT giữ nguyên.
-- **80 KHÔNG khả thi** nếu không phá sàn 2.05 ms. Weight đã cạn (int4 body + FP8 lm_head;
-  lm_head int4 chỉ thêm −0.11 ms = +0.85 ERS, dưới ngưỡng phân giải). KV chỉ còn ≤0.44 ms.
-  ⇒ **80 = crack sàn, và sàn = decode attention (§2b).** Không có đường khác — và đường đó
-  **không mở được bằng cờ CLI**, phải thay kernel attention (build image). Trong phạm vi cờ,
-  **77 là trần cứng**; mục tiêu vận hành đúng là **75–77 qua TTFT**.
+- **80 KHÔNG khả thi** nếu không phá sàn. Weight đã cạn (int4 body + FP8 lm_head; lm_head int4
+  chỉ thêm −0.11 ms = +0.85 ERS). KV chỉ còn ≤0.44 ms.
+  ⇒ **80 = crack sàn, và sàn = CPU của EngineCore (§2b)**, cụ thể 64 µs Python/request/step ở
+  `zero_block_ids` / `copy_to_gpu` / block-table hybrid. Vẫn phải build image — nhưng là **patch
+  Python đo được trên rig**, không phải viết kernel attention. Trong phạm vi cờ CLI, **77 là trần
+  cứng** và cờ đã cạn (còn +0.94 ERS, xem `compose-k3-frontend.yml`).
 
-## 5. KẾ HOẠCH → `PLAN-2026-07-27.md` — **rig để quyết định, portal chỉ để chốt bài**
+## 5. KẾ HOẠCH → `PLAN-2026-07-27.md` — **rig để A/B, portal chỉ để ăn điểm**
 
-Track A đã xong (§2b). Kế hoạch 27/07 viết lại: **0 lượt nộp**, toàn bộ là rig.
+**Rig giờ nhạy hơn portal ~10×.** Với client pin ra khỏi core 0-2 và bỏ rep lạnh sau mỗi boot,
+rig phân giải **Δ ≈ 0.3 ERS**; portal cần **≥4 ERS**. ⇒ **Không bao giờ A/B trên portal nữa.**
 
-**Vì sao không nộp.** Mô hình điểm đã kiểm chứng (TPOT 3.25 + ttft 47 ⇒ ERS 68.4 tính vs 68.57 đo).
-Kỷ lục 68.57 **đã nằm trong két** (best-of). Một lượt ở trạng thái tốt (65.5, σ=1.0) muốn vượt nó
-phải đi +3.07σ ⇒ p≈0.0011 ⇒ **15 lượt chỉ có ~1.1% cơ hội phá kỷ lục**. Cộng mọi Δ dưới 4 ERS đều
-không đọc được ⇒ **portal không còn dùng để A/B được nữa**. Đừng nộp để thăm dò.
+**Cổng nộp — tách làm hai, đừng gộp:**
+- **Cổng A (tiêu lượt để HỌC): đóng vĩnh viễn.** Không đọc được Δ < 4 ERS.
+- **Cổng B (tiêu lượt để ĂN ĐIỂM, best-of):** nộp khi ① rig cho Δ > 0 với hai bên **không chồng
+  lấn** (≥2 boot, chỉ rep ấm), ② output-preserving + giữ FULL cudagraph, ③ flag/patch đã verify
+  **trong chính image** bằng docker offline. **Không** đòi Δ ≥ 4 — 4 ERS là ngưỡng *đọc được*,
+  không phải ngưỡng *đáng nộp*; best-of chỉ cần dịch cả phân phối lên.
 
-**Ngân sách điểm — 80 cần CẢ HAI nửa, không nửa nào đủ một mình:**
-cắt nửa attention (TPOT 3.25→2.50) = **+6.5 ERS** · kéo ttft 50→20 = **+7.2 ERS** · cả hai = **82**.
+**Quota theo NGÀY, không dồn** ⇒ lượt không dùng là lượt mất trắng ⇒ khi đã có config nghiêm ngặt
+tốt hơn thì **nộp hết quota vào đúng nó**, không nộp đối chứng.
+`compose-k3-frontend.yml` (K3 + `--disable-uvicorn-access-log` + `--renderer-num-workers=2`,
+**+0.94 ERS** đo trên rig) đủ cổng B ⇒ P(phá 68.57) đi từ ~1.1% lên ~16% cho một ngày quota.
 
-**TTFT là trục có dụng cụ tốt nhất.** ttft ~50 ms trong khi prefill turn 2–6 chỉ ~150 token
-(~3–6 ms compute) ⇒ **~45 ms là hàng đợi/scheduler/frontend, bị chặn bởi 3 CPU core** — mà
-`taskset -c 0-2` trên rig tái lập **đúng** ràng buộc đó (khác băng thông, sai 5.6×, KB §5).
-⇒ Bóc TTFT bằng histogram `queue_time / prefill_time / ttft` là việc ưu tiên 1, không cần profiler.
+**Ngân sách điểm — 80 vẫn cần CẢ HAI nửa:** TTFT 43 = queue 0.0 + prefill 19 + **frontend 19**
+(= tokenize lại ~2900 token mỗi turn) · TPOT 3.33 = GPU 1.42 + **CPU 64 µs/req/step**.
+Hai đòn còn lại, cả hai là **patch Python đo được trên rig**: cache tokenization theo prefix
+(**+4 ERS**) và cắt input-prep hybrid (**+5 ERS**).
 
-**Ứng viên còn sống duy nhất ở tầng env var:** `VLLM_FLASH_ATTN_VERSION=2` và
-`VLLM_ATTENTION_BACKEND=TRITON_ATTN` — attention chiếm 54% và chưa ai đo FA2/Triton trên shape
-(B=27, hdim 64, 18 SM). Đo bằng `bench/prof_all.sh` (tỉ lệ cùng máy ⇒ độc lập regime).
-
-**Cổng nộp:** chỉ tiêu lượt khi rig cho ≥15% trên thành phần trội **và** quy đổi ra Δ ≥ 4 ERS
-**và** đòn đó output-preserving + không mất FULL cudagraph. Đủ ⇒ nộp 2 lượt cùng config.
+⚠️ **`vllm.__version__` trong image portal trả `0.22.1`** dù source khớp 0.25.1 gần như từng dòng.
+Mọi lập luận "nguồn 0.25.1" từ nay phải **grep trong chính image**, không grep bản pip trên rig.
 
 ## 6. QUY TẮC
 
-1. Δ < 4 ERS với 1 run mỗi bên = **không kết luận được**. Đừng đóng/mở trục dựa vào nó.
+1. Δ < 4 ERS với 1 run **portal** mỗi bên = **không kết luận được**. Đừng đóng/mở trục dựa vào nó.
+   Trên **rig** thì ngược lại: 2 boot × 2 rep ấm mỗi bên đọc được tới **0.3 ERS** — mọi A/B về đây.
+   ⚠️ Client harness **phải** `taskset -c 8-40` (server `0-2`) và **bỏ rep đầu sau mỗi boot**.
 2. Giữ `VLLM_LOGGING_LEVEL=WARNING`, `--disable-log-stats`, `--max-model-len=32768`
    (hạ max-len có nguy cơ làm probe long-context fail = mất bài).
 3. `failed` 4–6 là nền (~1.3%, ăn ~0.85 ERS). `>10` ⇒ dùng raw ERS, bỏ TPOT bóc.

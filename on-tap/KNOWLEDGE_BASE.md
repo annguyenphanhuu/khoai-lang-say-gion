@@ -130,7 +130,11 @@ không fork; cờ chỉ được `cli/serve.py` dùng mà portal ép entrypoint 
 Rust frontend: `VLLM_USE_RUST_FRONTEND` có trong `envs.py:545` nhưng binary `vllm-rs` **không có
 trong image**. Đuôi TTFT turn-1: không có (p95 chỉ 67–92).
 
-## 8. 🔬 nsys kernel-level, 27/07 — SÀN LÀ ATTENTION
+## 8. 🔬 nsys kernel-level, 27/07 sáng — attention = 54% **GPU busy** (KHÔNG phải 54% của step)
+
+> ⚠️ **Tiêu đề cũ "SÀN LÀ ATTENTION" đã bị phản chứng chiều 27/07** — xem §9 và
+> `FINDINGS-2026-07-27-RIG.md`. GPU chỉ chiếm ~43% của một step (1.42 / 3.33 ms); phần còn lại là
+> CPU của EngineCore. Mọi tỉ lệ dưới đây là tỉ lệ **trong thời gian GPU busy** và vẫn đúng như thế.
 
 **Cách đo** (`bench/prof_all.sh` + `bench/load27.py` + `bench/analyze.py`, rig H100, MPS
 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=14` ≈ 18/132 SM, `gpu-mem 0.2025` ≈ slice 18GB, `taskset 0-2`,
@@ -187,7 +191,16 @@ phải việc của cờ CLI. Trần cờ-CLI vẫn là **77** (STRATEGY §4), �
 HBM **3.35 TB/s (5.6×)**, **132 SM (~7×)** so với MiG. Đọc weight FP8: rig 0.36 ms vs portal 2.0 ms.
 ⇒ Mọi phán quyết về **băng thông** đo trên rig đều vô giá trị.
 **Rig dùng được cho:** accuracy/GPQA, correctness temp=0, **danh mục kernel + tỉ lệ giữa chúng**
-(nsys/ncu — đây là việc cần làm, `STRATEGY.md` §5B). Vận hành: `RUNBOOK-RUNPOD.md`.
+(nsys/ncu). Vận hành: `RUNBOOK-RUNPOD.md`.
+
+**✅ CẬP NHẬT 27/07 chiều — rig dùng được cho NHIỀU HƠN thế, vì nút cổ chai không phải băng thông.**
+Với server `taskset -c 0-2` **và client `taskset -c 8-40`** (chưa pin client = mọi số cũ sai:
+TTFT 94 vs 44 ms), rig cho **TTFT 43–48 / TPOT 3.33–3.45** so với portal **47–50 / 3.25**.
+Lý do khớp: cả hai trục đều bị chặn bởi **CPU 3 core**, thứ mà rig tái lập **chính xác** — chứ không
+phải HBM (`FINDINGS-2026-07-27-RIG.md`: MPS 50% ⇒ TPOT không đổi ⇒ GPU dư ≥2×).
+Độ nhạy: 2 boot × 2 rep **ấm** mỗi bên ⇒ đọc được **Δ 0.3 ERS** (portal cần ≥4). Bỏ rep đầu mỗi boot.
+⇒ Câu "mọi phán quyết đo trên rig đều vô giá trị" **chỉ còn đúng cho các đòn thuần băng thông**
+(weight-quant, KV-quant) — và hai đòn đó đều đã đóng.
 
 ## 6. Đọc source trong image (không cần GPU)
 
