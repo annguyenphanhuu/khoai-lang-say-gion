@@ -1,0 +1,51 @@
+# ============================================================================
+# CTRL — K3 + `--no-scheduler-reserve-full-isl`.  ARM CHÍNH cho ngày 27/07.
+# ============================================================================
+# ĐÂY LÀ NO-OP ĐÃ VERIFY TRONG SOURCE, không phải một đòn tối ưu:
+#   `kv_cache_manager.py:346` -> full_num_tokens = min(request.num_tokens, max_model_len)
+#   => reserve theo ISL THẬT (~4400 tok ≈ 54 MB), không theo 32768.
+#   Pool KV ~13 GB ≈ 1.07M token; đang dùng 27x4400 = 119K = 11% => không bao giờ chặn.
+#
+# VÌ SAO DÙNG NÓ THAY VÌ K3 NGUYÊN BẢN — lập luận trội (dominance):
+#   Ngày 26/07 cả ba run "config nền" chiếm đúng ba hạng thấp nhất trong 11 run (p=0.0061),
+#   trong khi tám biến thể đều ở ~65. Chưa biết đó là ngẫu nhiên hay thật.
+#   - Nếu là ngẫu nhiên  -> file này TƯƠNG ĐƯƠNG K3 (no-op), không mất gì.
+#   - Nếu là thật        -> file này hơn K3 ~5 ERS.
+#   Và vì nó là no-op nên OUTPUT BIT-IDENTICAL với K3 => rủi ro accuracy/protocol BẰNG 0,
+#   không cần GPQA. Không có kịch bản nào K3 thắng file này.
+#
+# ĐÃ ĐO: 65.46 (ttft 55/81, 6 failed, TPOT 3.35) — cao nhất ngày 26/07.
+# Chi tiết kế hoạch dùng file này: PLAN-2026-07-27.md
+services:
+  model:
+    image: annguyenphanhuu/vllm-w4a8:online-r3@sha256:2ba9c346bd48c2c6e3084769b2697f6eed753687127d26ef299deadb95677703
+    entrypoint:
+      - python3 #Don't change this to vllm-server
+      - -m #Don't change this to vllm-server
+      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
+    command:
+      - --model=/model #Don't change this to vllm-server
+      - --served-model-name=LFM2.5-1.2B-Instruct #Don't change this to vllm-server
+      - --host=0.0.0.0 #Don't change this to vllm-server
+      - --port=8000 #Don't change this to vllm-server
+      - --max-model-len=32768
+      - --gpu-memory-utilization=0.90
+      - --tensor-parallel-size=1
+      - --enable-prefix-caching
+      - --quantization=online_w4a8
+      - --no-scheduler-reserve-full-isl
+      - --disable-log-stats
+    environment:
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - VLLM_LOGGING_LEVEL=WARNING
+    ports:
+      - "8000:8000"
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

@@ -1,0 +1,56 @@
+--- /tmp/serving_r5.py	2026-06-05 04:44:23.000000000 +0700
++++ /tmp/serving_r6.py	2026-07-26 09:56:47.000000000 +0700
+@@ -4,6 +4,8 @@
+ import asyncio
+ import io
+ import json
++
++from vllm.entrypoints.openai.chat_completion import _fastsse  # [perf-patch fastsse]
+ import time
+ from collections.abc import AsyncGenerator, AsyncIterator
+ from collections.abc import Sequence as GenericSequence
+@@ -495,6 +497,28 @@
+             stream_options, self.enable_force_include_usage
+         )
+ 
++        # ---- [perf-patch fastsse] ------------------------------------------
++        # Fast-path serializer cho case streaming phổ thông (delta content
++        # thuần). Frame byte-identical với model_dump_json(exclude_unset=True)
++        # — được assert lúc build image (verify_fastsse.py). Mọi request có
++        # tool/reasoning/logprobs/usage/logging giữ NGUYÊN đường code gốc.
++        _fp_head = None
++        if (
++            not self.use_harmony
++            and self.parser_cls is None
++            and reasoning_parser is None
++            and not is_mistral_grammar_path
++            and not tool_choice_auto
++            and tool_choice_function_name is None
++            and request.tool_choice != "required"
++            and not (request.logprobs and request.top_logprobs is not None)
++            and not request.return_token_ids
++            and not include_continuous_usage
++            and not self.enable_log_outputs
++        ):
++            _fp_head = _fastsse.build_head(request_id, created_time, model_name)
++        # ---- [/perf-patch fastsse] -----------------------------------------
++
+         try:
+             async for res in result_generator:
+                 if res.prompt_token_ids is not None:
+@@ -793,6 +817,15 @@
+                                 delta=True,
+                             )
+ 
++                    # ---- [perf-patch fastsse] ----
++                    if (
++                        _fp_head is not None
++                        and output.finish_reason is None
++                        and delta_message.content is not None
++                    ):
++                        yield _fastsse.frame(_fp_head, i, delta_message.content)
++                        continue
++                    # ---- [/perf-patch fastsse] ----
+                     if output.finish_reason is None:
+                         # Send token-by-token response for each request.n
+                         choice_data = ChatCompletionResponseStreamChoice(

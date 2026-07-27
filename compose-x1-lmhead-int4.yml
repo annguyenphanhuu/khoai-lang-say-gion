@@ -1,0 +1,51 @@
+# ============================================================================
+# X1 — K3 + `LMHEAD_INT4=1`. Đòn WEIGHT cuối cùng còn lại. 1 BIẾN (env, image r5).
+# ============================================================================
+# CƠ SỞ — hồi quy đã kiểm định (STRATEGY.md §2): TPOT = 2.05 + 1.63*weight_GB, R²=0.986,
+# slope 613 GB/s ≈ băng thông danh nghĩa. lm_head FP8→int4: weight 0.734 → 0.667 GB
+# ⇒ TPOT −0.11 ms ⇒ **+0.85 ERS**. Đây là dự đoán từ mô hình đã fit, không phải suy đoán.
+#
+# ⚠️ +0.85 NẰM DƯỚI ngưỡng phân giải 1v1 (~4 ERS) và dưới biến động trạng thái máy (5.7 ERS)
+# ⇒ **một lượt nộp KHÔNG chứng minh được gì**. Giá trị của nó là dịch trung bình lên một chút
+# cho mục đích best-of, không phải để "đo xem có thắng không".
+# Hai lần đo trước (66.21 ở INFO, 63.32 ở WARNING) đều trong vùng không phân giải được.
+#
+# ⚠️ RỦI RO ACCURACY: lm_head là layer sai số lớn nhất. Nếu dùng làm bài chốt thì BẮT BUỘC
+# verify GPQA trên rig (portal trả accuracy_drop=0 cho mọi thứ nên vô dụng).
+# Nếu chỉ còn ít lượt và muốn an toàn: nộp compose-w4a8-lmheadfp8.yml (K3) thay vì file này.
+#
+# r5 khi KHÔNG set LFM2_SWA chạy y hệt r3 (validate_build.py kiểm lúc build).
+# ⚠️ TUYỆT ĐỐI không set LFM2_SWA — abort protocol, mất bài.
+services:
+  model:
+    image: annguyenphanhuu/vllm-w4a8:online-r5@sha256:92ca2d9635e807c1919bdbfb34c35e8417cc89ca68d78d942bd2e9f74fd32091
+    entrypoint:
+      - python3 #Don't change this to vllm-server
+      - -m #Don't change this to vllm-server
+      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
+    command:
+      - --model=/model #Don't change this to vllm-server
+      - --served-model-name=LFM2.5-1.2B-Instruct #Don't change this to vllm-server
+      - --host=0.0.0.0 #Don't change this to vllm-server
+      - --port=8000 #Don't change this to vllm-server
+      - --max-model-len=32768
+      - --gpu-memory-utilization=0.90
+      - --tensor-parallel-size=1
+      - --enable-prefix-caching
+      - --quantization=online_w4a8
+      - --disable-log-stats
+    environment:
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - VLLM_LOGGING_LEVEL=WARNING
+      - LMHEAD_INT4=1   # <<< BIẾN DUY NHẤT
+    ports:
+      - "8000:8000"
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

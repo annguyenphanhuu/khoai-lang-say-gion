@@ -112,6 +112,19 @@ class OnlineW4A8LinearMethod(QuantizeMethodBase):
 class OnlineW4A8Config(QuantizationConfig):
     def __init__(self):
         super().__init__()
+        self._fp8_cfg = None
+
+    def _fp8(self):
+        """Fp8Config của CHÍNH image này (dispatch ParallelLMHead đã có nhờ patch_full_fp8.py).
+
+        Dùng lại nguyên đường code đã chạy thật ở compose-cpu-lean.yml (64.67) thay vì tự
+        viết method mới cho lm_head.
+        """
+        if self._fp8_cfg is None:
+            from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+            self._fp8_cfg = Fp8Config(is_checkpoint_fp8_serialized=False,
+                                      activation_scheme="dynamic")
+        return self._fp8_cfg
 
     @classmethod
     def get_name(cls):
@@ -135,6 +148,21 @@ class OnlineW4A8Config(QuantizationConfig):
 
     def get_quant_method(self, layer, prefix: str):
         from vllm.model_executor.layers.linear import LinearBase
+        from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
         if isinstance(layer, LinearBase):
             return OnlineW4A8LinearMethod(self)
-        return None  # embedding / lm_head (tied) / norms -> giữ nguyên (BF16)
+        # [K3] lm_head 65536x2048: BF16 = 268MB/step. FP8 = 134MB/step ⇒ -0.22ms TPOT.
+        # KHÔNG int4 (lm_head là layer sai số cao nhất); FP8 đã đủ hạ một nửa byte.
+        # embed_tokens là VocabParallelEmbedding thuần (không phải ParallelLMHead) ⇒ vẫn BF16.
+        if isinstance(layer, ParallelLMHead):
+            # [K4] LMHEAD_INT4=1 => int4 luôn: 134MB -> 67MB/step (-0.11ms). Rủi ro accuracy cao hơn
+            # FP8 (lm_head là layer sai số lớn nhất) ⇒ NẾU thắng ERS thì BẮT BUỘC verify GPQA trên rig
+            # trước khi chọn làm bài chốt, không tin `accuracy_drop` của portal.
+            import os
+            if os.environ.get("LMHEAD_INT4") == "1":
+                return OnlineW4A8LinearMethod(self)
+            method = self._fp8().get_quant_method(layer, prefix)
+            assert method is not None, (
+                "fp8 dispatch trả None cho ParallelLMHead -> base image thiếu patch_full_fp8")
+            return method
+        return None  # embedding / norms -> giữ nguyên (BF16)
