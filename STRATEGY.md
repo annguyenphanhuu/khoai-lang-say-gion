@@ -106,24 +106,29 @@ TPOT hiện tại **3.25**. ⇒ **Trần tuyệt đối của kiến trúc hiệ
   **không mở được bằng cờ CLI**, phải thay kernel attention (build image). Trong phạm vi cờ,
   **77 là trần cứng**; mục tiêu vận hành đúng là **75–77 qua TTFT**.
 
-## 5. KẾ HOẠCH → `PLAN-2026-07-27.md` (15 lượt, có cổng quyết định)
+## 5. KẾ HOẠCH → `PLAN-2026-07-27.md` — **rig để quyết định, portal chỉ để chốt bài**
 
-Tóm tắt hình dạng, chi tiết ở file kế hoạch:
+Track A đã xong (§2b). Kế hoạch 27/07 viết lại: **0 lượt nộp**, toàn bộ là rig.
 
-**Track A — rig, 0 lượt nộp, ~$6, KHỞI ĐỘNG TRƯỚC.** `nsys` profile một decode step ở B≈27 với
-`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=14` (mô phỏng 18 SM) và `--cuda-graph-trace=node`.
-Câu hỏi duy nhất: **1.6 ms sàn gồm những kernel nào?** Đây là đường duy nhất tới 80.
+**Vì sao không nộp.** Mô hình điểm đã kiểm chứng (TPOT 3.25 + ttft 47 ⇒ ERS 68.4 tính vs 68.57 đo).
+Kỷ lục 68.57 **đã nằm trong két** (best-of). Một lượt ở trạng thái tốt (65.5, σ=1.0) muốn vượt nó
+phải đi +3.07σ ⇒ p≈0.0011 ⇒ **15 lượt chỉ có ~1.1% cơ hội phá kỷ lục**. Cộng mọi Δ dưới 4 ERS đều
+không đọc được ⇒ **portal không còn dùng để A/B được nữa**. Đừng nộp để thăm dò.
 
-**Track B — 15 lượt, 4 block:** (1) phân định K3 vs CTRL xen kẽ 4 lượt — trả lời "config nền có
-thật sự tệ hơn 5 ERS không"; (2) `lmhead-int4` ×2 đóng nốt trục weight; (3) **4 lượt để trống**
-chờ nsys chỉ lever; (4) xổ số best-of.
+**Ngân sách điểm — 80 cần CẢ HAI nửa, không nửa nào đủ một mình:**
+cắt nửa attention (TPOT 3.25→2.50) = **+6.5 ERS** · kéo ttft 50→20 = **+7.2 ERS** · cả hai = **82**.
 
-**Arm chính là `compose-ctrl-noreserve.yml`, không phải K3** — lập luận trội: nó là no-op đã
-verify (`kv_cache_manager.py:346`) nên output bit-identical với K3, rủi ro accuracy bằng 0; nếu
-hiệu ứng "config nền" là thật thì nó hơn K3 ~5 ERS, nếu là ngẫu nhiên thì nó bằng. Không có kịch
-bản nào K3 thắng nó.
+**TTFT là trục có dụng cụ tốt nhất.** ttft ~50 ms trong khi prefill turn 2–6 chỉ ~150 token
+(~3–6 ms compute) ⇒ **~45 ms là hàng đợi/scheduler/frontend, bị chặn bởi 3 CPU core** — mà
+`taskset -c 0-2` trên rig tái lập **đúng** ràng buộc đó (khác băng thông, sai 5.6×, KB §5).
+⇒ Bóc TTFT bằng histogram `queue_time / prefill_time / ttft` là việc ưu tiên 1, không cần profiler.
 
-**Kỳ vọng thật của ngày mai: 66–68.** 80 không nằm trong tầm 15 lượt nộp; nó nằm ở Track A.
+**Ứng viên còn sống duy nhất ở tầng env var:** `VLLM_FLASH_ATTN_VERSION=2` và
+`VLLM_ATTENTION_BACKEND=TRITON_ATTN` — attention chiếm 54% và chưa ai đo FA2/Triton trên shape
+(B=27, hdim 64, 18 SM). Đo bằng `bench/prof_all.sh` (tỉ lệ cùng máy ⇒ độc lập regime).
+
+**Cổng nộp:** chỉ tiêu lượt khi rig cho ≥15% trên thành phần trội **và** quy đổi ra Δ ≥ 4 ERS
+**và** đòn đó output-preserving + không mất FULL cudagraph. Đủ ⇒ nộp 2 lượt cùng config.
 
 ## 6. QUY TẮC
 
