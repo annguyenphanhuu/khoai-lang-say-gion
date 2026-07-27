@@ -50,32 +50,39 @@ Con số 1.09 GB KV/step là **phép tính**, không phải phép đo — và n�
 
 ⇒ **Cơ cấu thật: sàn 2.05 (61%) · weight 1.20 (36%) · KV ≤0.44 (≤13%).**
 
-### 🔴 2b. SÀN = **CPU của EngineCore**, KHÔNG phải attention (sửa 27/07 chiều)
+### ✅ 2b. SÀN = **decode attention** — đã được portal xác nhận trực tiếp 27/07 tối
 
-Bản trước kết luận "sàn 2.05 ms = decode attention" từ nsys. **Số nsys đúng, suy luận sai**: nó đo
-tỉ lệ trong *thời gian GPU busy*, không đo GPU chiếm bao nhiêu phần của một step.
-Đo lại bằng ERS harness trên rig, **client pin ra khỏi core 0-2** (mọi số rig cũ nhiễm lỗi này ⇒
-TTFT bị thổi 94 vs 44 ms) — chi tiết `FINDINGS-2026-07-27-RIG.md`:
+Ngày 27/07 có một vòng "phản chứng rồi phục hồi". Kết luận cuối, có số của **chính máy chấm**:
 
-| Thí nghiệm | Số | Suy ra |
-| :-- | :-- | :-- |
-| `--no-async-scheduling` | TPOT 3.33 → 4.75 | async = `max(CPU,GPU)`, tắt = `CPU+GPU` ⇒ **{3.33, 1.42}** |
-| **MPS 50% (cắt nửa SM)** | TPOT **không đổi** | GPU dư ≥2× ⇒ **3.33 là CPU**, 1.42 là GPU |
-| quét RATE (B = 7.8/15.8/27) | `TPOT ≈ 1.60 + 0.064×B` | intercept = GPU ✓ · slope = **64 µs Python/req/step** |
-| spy `VLLM::EngineCore` | `zero_block_ids` 18% · `copy_to_gpu` 17% · `mamba_get_block_table_tensor` 5% · `collect_mamba_copy_meta` 3% | **43% CPU/step = bookkeeping hybrid LFM2. 0% attention.** |
+**Bước 1 — tách CPU/GPU bằng `--no-async-scheduling`** (async mặc định BẬT ⇒
+`TPOT_on = max(C,G)`, tắt ⇒ `TPOT_off = C+G` ⇒ `d = min(C,G)`). Portal đo được:
+`TPOT_on = 3.481`, `TPOT_off = 5.228` ⇒ **`{C, G} = {3.481, 1.748}`**.
 
-⇒ Mục tiêu đúng của trục TPOT là **cắt việc Python mỗi request mỗi step**, không phải thay kernel
-attention. Cắt đôi attention chỉ đáng ~0.2 ms (không phải 0.75).
+**Bước 2 — phân xử ai là ai bằng 4 điểm weight cũ.** `H_CPU` (C là max) buộc ba điểm weight thấp
+phải **phẳng** ở 3.48; dữ liệu có **dốc đơn điệu** full-FP8 3.86 → W4A8-lmheadBF16 3.66 → K3 3.33.
+⇒ `H_CPU` **bị bác**; nhánh scale theo weight chính là nhánh max:
 
-**Số nsys cũ vẫn giữ giá trị mô tả** (decode thuần B=27, MPS 14% ≈ 18 SM): attention 2.75 ms/step
-= **54% GPU busy** (6 call `flash_attn_fwd_sm90` hdim64) · gemm 37% · elementwise **7.4%** ·
-gap 4–7% ⇒ **không launch-bound**. `t_attn/call = 56 µs + 0.100 µs × ctx`.
-KV fp8 chỉ cắt attention 19% ⇒ attention bị chặn bởi độ trễ/số giao dịch, không phải byte —
-đây vẫn là **cơ chế** giải thích `k=1.006` của §3.1.
+> **GPU_step = 3.48 ms · CPU_step = 1.75 ms (bị che hoàn toàn, dư 1.73 ms headroom)**
+> ⇒ `TPOT = 2.05 + 1.63×GB` là **GPU**, và intercept 2.05 = phần GPU không phụ thuộc weight.
 
-⇒ Hệ quả cứng **không đổi**: fusion (≤7.4%), cudagraph-sizes (không launch-bound), KV quant,
-cascade (mất cudagraph ⇒ eager) — **không cái nào là lever**. Cái đổi là **đích ngắm**:
-`zero_block_ids` / `copy_to_gpu` / block-table hybrid, chứ không phải kernel attention.
+**Bước 3 — intercept 2.05 là gì:** nsys (decode thuần B=27, MPS 14% ≈ 18 SM) cho attention
+**54% GPU busy** (6 call `flash_attn_fwd_sm90` hdim64, `t_attn/call = 56 µs + 0.100 µs × ctx`) ·
+gemm 37% · elementwise 7.4% · gap 4–7% ⇒ **không launch-bound**.
+Quy về portal ⇒ **attention ≈ 1.5 ms ≈ 73% của 2.05**. KV fp8 chỉ cắt attention 19% ⇒ attention bị
+chặn bởi **độ trễ/số giao dịch** trên slice SM nhỏ, không phải byte — cơ chế của `k=1.006` (§3.1).
+
+⇒ **Đích ngắm số 1 của trục TPOT: decode attention.** Ứng viên chưa thử: FA2 / TRITON_ATTN
+(env var, không cần build image) và **`num_splits` của FA3** (nsys thấy split-KV + combine;
+heuristic gần như chắc chắn sai với B=27 × 6 layer trên ~18 SM — patch nhỏ, rẻ hơn viết kernel).
+
+⚠️ **Cạm bẫy đã mắc:** rig full-SM là **CPU-bound** (CPU 3.33 > GPU 1.42) nên mọi thay đổi GPU
+**vô hình** ở đó; và CPU của rig **chậm hơn portal ~1.9×** (RunPod core chia sẻ). Muốn soi GPU
+trên rig phải vào regime **MPS 14% + RATE thấp**, và xác nhận bằng `--no-async-scheduling`
+(`d` phải ra số **nhỏ**). Mọi kết luận CPU đo trên rig phải **chia ~1.9** trước khi quy sang portal.
+⇒ Đòn "patch input-prep hybrid" (`zero_block_ids`/`copy_to_gpu`) **đã huỷ**: nó nhắm CPU đang bị che.
+
+⇒ Hệ quả cứng không đổi: fusion (≤7.4%), cudagraph-sizes (không launch-bound), KV quant,
+cascade (mất cudagraph ⇒ eager) — **không cái nào là lever**.
 
 ## 3. TRỤC ĐÃ ĐÓNG
 
@@ -109,12 +116,13 @@ FlashInfer · sliding-window (**abort**) · mọi spec decode · custom ShortCon
 TPOT hiện tại **3.25**. ⇒ **Trần tuyệt đối của kiến trúc hiện nay là 77.0** (ttft về sàn 10 ms).
 
 - **75 khả thi**: chỉ cần ttft 54 → ~20 ms, TPOT giữ nguyên.
-- **80 KHÔNG khả thi** nếu không phá sàn. Weight đã cạn (int4 body + FP8 lm_head; lm_head int4
-  chỉ thêm −0.11 ms = +0.85 ERS). KV chỉ còn ≤0.44 ms.
-  ⇒ **80 = crack sàn, và sàn = CPU của EngineCore (§2b)**, cụ thể 64 µs Python/request/step ở
-  `zero_block_ids` / `copy_to_gpu` / block-table hybrid. Vẫn phải build image — nhưng là **patch
-  Python đo được trên rig**, không phải viết kernel attention. Trong phạm vi cờ CLI, **77 là trần
-  cứng** và cờ đã cạn (còn +0.94 ERS, xem `compose-k3-frontend.yml`).
+- **80 đòi CẢ HAI nửa gần như đồng thời**: `TPOT 2.74 + ttft 20 = 80.0`. Một mình thì không đủ —
+  ttft về sàn 10 với TPOT 3.19 chỉ ra **78.4**; cắt nửa attention với ttft 47 chỉ ra **73.3**.
+- Weight đã cạn (còn lm_head int4 = −0.11 ms = +0.85 ERS). KV ≤0.44 ms. CPU bị che (§2b).
+  ⇒ **80 = cắt ~nửa decode attention + kéo ttft xuống ~20.** Nửa attention: FA2/Triton (env var)
+  hoặc `num_splits` (patch nhỏ). Nửa ttft: **phụ thuộc `compose-diag-nocache.yml`** — nếu ttft là
+  prefill GPU thì trục đó gần như bất động và **trần thực tế là 73–77**, 80 chỉ đến bằng một lần
+  rút may. Chiến lược đúng: kéo trung bình lên 73–77 rồi **mua thật nhiều vé** (best-of).
 
 ## 5. KẾ HOẠCH → `PLAN-2026-07-27.md` — **rig để A/B, portal chỉ để ăn điểm**
 
@@ -122,7 +130,10 @@ TPOT hiện tại **3.25**. ⇒ **Trần tuyệt đối của kiến trúc hiệ
 rig phân giải **Δ ≈ 0.3 ERS**; portal cần **≥4 ERS**. ⇒ **Không bao giờ A/B trên portal nữa.**
 
 **Cổng nộp — tách làm hai, đừng gộp:**
-- **Cổng A (tiêu lượt để HỌC): đóng vĩnh viễn.** Không đọc được Δ < 4 ERS.
+- **Cổng A (tiêu lượt để HỌC): mở, nhưng chỉ khi Δ dự đoán > 4 ERS *và* rig không trả lời được.**
+  Đa số câu hỏi rig trả lời rẻ hơn + nhạy hơn 10× ⇒ hiếm khi mở. Ứng viên hợp lệ duy nhất đang có:
+  `compose-diag-noasync.yml` — đo `min(CPU_step, GPU_step)` của **chính máy chấm** (rig không thay
+  được), tín hiệu −7…−11 ERS. Xem `PLAN-2026-07-27.md` §4b.
 - **Cổng B (tiêu lượt để ĂN ĐIỂM, best-of):** nộp khi ① rig cho Δ > 0 với hai bên **không chồng
   lấn** (≥2 boot, chỉ rep ấm), ② output-preserving + giữ FULL cudagraph, ③ flag/patch đã verify
   **trong chính image** bằng docker offline. **Không** đòi Δ ≥ 4 — 4 ERS là ngưỡng *đọc được*,

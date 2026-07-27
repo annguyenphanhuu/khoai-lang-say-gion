@@ -1,5 +1,12 @@
 # SỔ ĐO RIG 27/07 — W1 (TTFT) và những gì nó lật lại
 
+> 🔴 **ĐỌC TRƯỚC — hiệu chỉnh tối 27/07 bằng số của chính portal** (`PLAN-2026-07-27.md` §2):
+> portal đo `{CPU_step, GPU_step} = {1.75, 3.48}` ⇒ **portal GPU-bound**, CPU **bị che hoàn toàn**.
+> Rig thì ngược lại (CPU 3.33 > GPU 1.42) vì **CPU của rig chậm hơn portal ~1.9×**.
+> ⇒ §5b–§5g dưới đây **đúng cho rig** nhưng **không chuyển sang portal**; đòn "cắt input-prep
+> hybrid" (§6.2) **đã huỷ**. Mọi số CPU của rig phải **chia 1.9** trước khi quy sang portal.
+> Phần vẫn còn giá trị nguyên vẹn: §0 (pin client), §1–§4b (bóc TTFT + 2 cờ frontend), §5h (đã chết).
+
 > Máy: H100 SXM 80GB, vllm 0.25.1 pip, model `/workspace/model` `--quantization fp8`,
 > `--gpu-memory-utilization 0.225`, `--max-model-len 32768`, `--enable-prefix-caching`,
 > server `taskset -c 0-2`, `OMP/MKL=1`, `VLLM_LOGGING_LEVEL=WARNING`.

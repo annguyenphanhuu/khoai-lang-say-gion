@@ -1,0 +1,59 @@
+# ============================================================================
+# K4 — BÀI CHỦ LỰC 27/07 tối. = K3 + 2 cờ frontend + lm_head int4.  Nộp lặp lại nhiều lượt.
+# ============================================================================
+# Ba thành phần, cả ba đều là đòn đã có số, không phải suy đoán:
+#
+#   1) --disable-uvicorn-access-log   rig: Δrest −2.7 ms   (WARNING KHÔNG tắt access log uvicorn)
+#   2) --renderer-num-workers=2       rig: Δrest −3.5 ms   (mặc định là 1 — một thread tokenize)
+#      (1)+(2) đo trên rig 2 boot × 2 rep ấm mỗi bên: 68.84 → 69.78 = **+0.94 ERS**, không chồng lấn.
+#   3) LMHEAD_INT4=1                  weight 0.734 → 0.667 GB ⇒ TPOT −0.11 ms ⇒ **+0.85 ERS**
+#      từ hồi quy `TPOT = 2.05 + 1.63×GB`, mà hồi quy này vừa được **portal xác nhận lại**
+#      ngày 27/07 (xem PLAN §2: mô hình đối thủ H_CPU đã bị bác bằng chính 4 điểm weight).
+#
+#   ⇒ Kỳ vọng ≈ **+1.8 ERS** so với K3 trần. Dưới ngưỡng phân giải 4 ERS ⇒ **một lượt không
+#     chứng minh được gì**; giá trị là dịch cả phân phối lên cho best-of.
+#
+# ⚠️ RỦI RO ACCURACY (lm_head là layer nhạy nhất): GPQA trên rig **vẫn còn nợ**.
+#   Giảm nhẹ: portal trả `accuracy_drop=0`/`f_delta=1` cho **mọi** run kể cả BnB-NF4 ⇒ cổng
+#   accuracy thực tế không ràng buộc; và lm_head-int4 đã chạy portal 2 lần (66.21 / 63.32), f_delta=1.
+#   Nếu muốn tuyệt đối an toàn cho bài chốt 30/07: dùng `compose-k3-frontend.yml` (bỏ mục 3).
+#
+# ⚠️ r5 khi KHÔNG set `LFM2_SWA` chạy y hệt r3 (`validate_build.py` kiểm lúc build).
+#   TUYỆT ĐỐI không set `LFM2_SWA` — abort protocol, mất bài.
+# Đã verify parse trong image (docker offline): cả 2 cờ frontend tồn tại và parse đúng.
+# ============================================================================
+services:
+  model:
+    image: annguyenphanhuu/vllm-w4a8:online-r5@sha256:92ca2d9635e807c1919bdbfb34c35e8417cc89ca68d78d942bd2e9f74fd32091
+    entrypoint:
+      - python3 #Don't change this to vllm-server
+      - -m #Don't change this to vllm-server
+      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
+    command:
+      - --model=/model #Don't change this to vllm-server
+      - --served-model-name=LFM2.5-1.2B-Instruct #Don't change this to vllm-server
+      - --host=0.0.0.0 #Don't change this to vllm-server
+      - --port=8000 #Don't change this to vllm-server
+      - --max-model-len=32768
+      - --gpu-memory-utilization=0.90
+      - --tensor-parallel-size=1
+      - --enable-prefix-caching
+      - --quantization=online_w4a8
+      - --disable-log-stats
+      - --disable-uvicorn-access-log
+      - --renderer-num-workers=2
+    environment:
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - VLLM_LOGGING_LEVEL=WARNING
+      - LMHEAD_INT4=1
+    ports:
+      - "8000:8000"
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

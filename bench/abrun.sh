@@ -19,7 +19,7 @@ fi
 LAUNCH="python3 -m vllm.entrypoints.openai.api_server"
 [ "$SPY" = "1" ] && LAUNCH="python3 /workspace/bench/spyserve.py vllm.entrypoints.openai.api_server"
 nohup taskset -c $CORES env SPY_OUT=$O/spy.txt SPY_HZ=100 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-  VLLM_LOGGING_LEVEL=${LOGLVL:-WARNING} $MPSENV $LAUNCH \
+  VLLM_LOGGING_LEVEL=${LOGLVL:-WARNING} $MPSENV ${ENVX:-} $LAUNCH \
   --model /workspace/model --served-model-name LFM2.5-1.2B-Instruct --port 8000 \
   --max-model-len 32768 --gpu-memory-utilization 0.225 --enable-prefix-caching \
   --quantization fp8 $EXTRA > $O/server.log 2>&1 &

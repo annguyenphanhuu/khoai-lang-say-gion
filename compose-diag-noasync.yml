@@ -1,0 +1,73 @@
+# ============================================================================
+# DIAG-NOASYNC — **phép đo, KHÔNG phải đòn ăn điểm.** Chờ điểm THẤP (~52–58). Đó là đúng.
+# 1 BIẾN duy nhất vs `compose-k3-frontend.yml`: thêm `--no-async-scheduling`.
+# ============================================================================
+# ĐO CÁI GÌ: `min(CPU_step, GPU_step)` của **chính máy chấm**.
+#
+#   Async scheduling (mặc định BẬT) chồng lấn CPU của step N+1 lên GPU của step N:
+#       TPOT_on  = max(CPU_step, GPU_step)
+#       TPOT_off = CPU_step + GPU_step
+#   ⇒  d := TPOT_off − TPOT_on = **min(CPU_step, GPU_step)**
+#   Trên rig đo được: TPOT 3.33 → 4.75 ⇒ d = 1.42 ⇒ {CPU, GPU} = {3.33, 1.42}, và MPS 50%
+#   (cắt nửa SM, TPOT không đổi) chỉ ra 3.33 là CPU. Portal không đổi được SM ⇒ phải suy gián tiếp.
+#
+# VÌ SAO ĐÁNG MỘT LƯỢT: hai mô hình đang **gần như trùng nhau ở đúng điểm K3** nên mọi số cũ
+# không phân biệt được chúng —
+#   H_GPU (STRATEGY §2, băng thông): TPOT = 2.05 + 1.63×GB ⇒ G(0.734 GB) = 3.25 = TPOT đo. CPU < G.
+#   H_CPU (rig 27/07):               TPOT = max(CPU, G) và CPU ≈ 3.3 ≳ G ⇒ cũng ra ~3.25.
+#   Hồi quy 4 điểm weight R²=0.986 **không** loại được H_CPU: ở BF16/FP8 thì G lớn nên G thắng ở
+#   mọi điểm; chỉ tại K3 hai đường mới chạm nhau. Đây là chỗ duy nhất tách được chúng.
+#
+# CÁCH ĐỌC (bóc TPOT bằng công thức KB §2, cần `failed ≤ 10`, nếu >10 thì bỏ, đo lại):
+#   d = TPOT(bài này) − TPOT(compose-k3-frontend nộp cùng phiên)
+#
+#   | d đo được | Kết luận | Việc của 28–30/07 |
+#   | :-- | :-- | :-- |
+#   | ~1.2–1.6 ms | CPU_portal ≈ 1.4 ≪ GPU 3.25 ⇒ **portal GPU/băng-thông-bound**, CPU của rig chậm gấp ~2× ⇒ kết luận CPU của rig KHÔNG chuyển sang portal | **BỎ** patch input-prep hybrid; dồn vào tokenization-cache (TTFT) + trục attention |
+#   | ~2.0–3.2 ms | CPU_portal ≈ 2–3.2, ngang GPU ⇒ **portal cũng CPU-bound** (một phần hoặc toàn phần) | **LÀM** patch input-prep hybrid: `zero_block_ids` / `copy_to_gpu` / block-table |
+#   | >3.4 ms hoặc TPOT_on đổi | mô hình `max()` sai ở portal | dừng, đọc lại từ đầu |
+#
+#   ⚠️ Phải nộp **cùng phiên** với ít nhất một run `compose-k3-frontend.yml` để có nền cùng trạng
+#   thái máy (portal nhảy ~5.7 ERS ≈ 0.5 ms TPOT giữa hai trạng thái, STRATEGY §1).
+#   Tín hiệu kỳ vọng 1.4–3.2 ms ≫ nhiễu trạng thái 0.5 ms ⇒ đọc được bằng 1 cặp.
+#
+# AN TOÀN: output-preserving tuyệt đối (chỉ là lịch chồng lấn CPU/GPU, không đụng model, KV,
+# sampling, cudagraph). Đã verify parse **trong chính image này** (docker offline):
+#   `--no-async-scheduling` có trong parser, `parse_args` ⇒ `async_scheduling=False`.
+#   `arg_utils.py:1411` đăng ký `--async-scheduling`; `config/scheduler.py:146` default None (auto=True).
+# ============================================================================
+services:
+  model:
+    image: annguyenphanhuu/vllm-w4a8:online-r3@sha256:2ba9c346bd48c2c6e3084769b2697f6eed753687127d26ef299deadb95677703
+    entrypoint:
+      - python3 #Don't change this to vllm-server
+      - -m #Don't change this to vllm-server
+      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
+    command:
+      - --model=/model #Don't change this to vllm-server
+      - --served-model-name=LFM2.5-1.2B-Instruct #Don't change this to vllm-server
+      - --host=0.0.0.0 #Don't change this to vllm-server
+      - --port=8000 #Don't change this to vllm-server
+      - --max-model-len=32768
+      - --gpu-memory-utilization=0.90
+      - --tensor-parallel-size=1
+      - --enable-prefix-caching
+      - --quantization=online_w4a8
+      - --disable-log-stats
+      - --disable-uvicorn-access-log
+      - --renderer-num-workers=2
+      - --no-async-scheduling   # <<< BIẾN DUY NHẤT. Tắt chồng lấn CPU/GPU để lộ min(CPU,GPU).
+    environment:
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - VLLM_LOGGING_LEVEL=WARNING
+    ports:
+      - "8000:8000"
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

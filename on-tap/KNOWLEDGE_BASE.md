@@ -63,6 +63,8 @@ image r6 fastsse 64.87 (58) · kv fp8_e4m3 66.94 (50).
 | Config | ERS | ttft | TPOT |
 | :-- | --: | --: | --: |
 | **K3 25/07 — chưa từng tái lập** | **68.57** | 47 | 3.19 |
+| **27/07** K3 + 2 cờ frontend (`k3-frontend`) | 63.10 | 61 | **3.481** (tbt 4 ✓) |
+| **27/07** ↑ + `--no-async-scheduling` (**phép đo**) | 51.63 | 58 | **5.228** (tbt 5 ✓) |
 | gpu-mem 0.95 | 67.03 | 48 | 3.47 |
 | block-size 16 · 32 | 65.81 · 63.09 | 51 · 61 | 3.54 · 3.60 |
 | K3 − `--disable-log-stats` | 65.25 | 55 | 3.38 |
@@ -90,6 +92,13 @@ image r6 fastsse 64.87 (58) · kv fp8_e4m3 66.94 (50).
 **Ba slope còn đứng vững** (Δ đủ lớn để vượt biến động trạng thái):
 weight BF16→int4 = −2.8 ms TPOT (khớp 613 GB/s) · tắt cudagraph = tbt 3→12, **đừng đụng** ·
 4-bit weight qua được accuracy gate.
+
+**✅ 27/07 — tách CPU/GPU của CHÍNH máy chấm.** `async_scheduling` default ON ⇒
+`TPOT_on = max(C,G)`; `--no-async-scheduling` ⇒ `TPOT_off = C+G` ⇒ `d = min(C,G) = 1.748`,
+`max = 3.481`. Phân xử bằng 4 điểm weight: `H_CPU` buộc full-FP8 / W4A8-lmheadBF16 / K3 phải
+**phẳng** ở 3.48, nhưng đo được **dốc** 3.86 → 3.66 → 3.33 ⇒ `H_CPU` bị bác.
+⇒ **GPU_step = 3.48 · CPU_step = 1.75 (bị che, dư 1.73 ms).** Hồi quy `2.05 + 1.63×GB` **là GPU**.
+⇒ Rig CPU **chậm hơn portal ~1.9×** (3.33 vs 1.75) — chia 1.9 trước khi quy số CPU của rig sang portal.
 
 ## 4. Đã đóng — root cause
 
