@@ -29,8 +29,9 @@ với `ERS_hc = ERS·420/(420−failed)`.
 (lỗi không phải MCAR — chúng là đuôi chậm, vốn đã cho ~0 điểm): dùng raw ERS, bỏ TPOT bóc.
 
 **Vật lý TPOT (hồi quy 4 điểm weight, R²=0.986):** `TPOT = 2.05 ms + 1.63 ms/GB × weight_GB`.
-Cơ cấu K3: **sàn 2.05 (61%) · weight 1.20 (36%) · KV ≤0.44 (≤13%)**. ~1.6 ms chưa giải thích.
+Cơ cấu K3: **sàn 2.05 (61%) · weight 1.20 (36%) · KV ≤0.44 (≤13%)**.
 ⚠️ **Đừng suy TPOT từ phép tính byte KV.** Phép tính cho 1.09 GB/step; số đo cho ≤0.44 ms.
+✅ **1.6 ms "chưa giải thích" đã được định danh = decode attention** — xem **§8** (nsys, 27/07).
 
 ## 3. Bảng kết quả portal
 
@@ -128,6 +129,58 @@ async **đã default-on**, `config/vllm.py:975`) · FlashInfer: prefill chậm �
 không fork; cờ chỉ được `cli/serve.py` dùng mà portal ép entrypoint module.
 Rust frontend: `VLLM_USE_RUST_FRONTEND` có trong `envs.py:545` nhưng binary `vllm-rs` **không có
 trong image**. Đuôi TTFT turn-1: không có (p95 chỉ 67–92).
+
+## 8. 🔬 nsys kernel-level, 27/07 — SÀN LÀ ATTENTION
+
+**Cách đo** (`bench/prof_all.sh` + `bench/load27.py` + `bench/analyze.py`, rig H100, MPS
+`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=14` ≈ 18/132 SM, `gpu-mem 0.2025` ≈ slice 18GB, `taskset 0-2`,
+vLLM 0.25.1 + patch `online_w4a8` + `bench/fp8_lmhead_patch.py`, `--cuda-graph-trace=node`).
+Cửa sổ **decode thuần**: 27 request `ignore_eos` sinh dài, **không** request mới ⇒ B=27 chính xác,
+0% prefill. Phân đoạn step bằng lm_head GEMM (1 lần/step); kiểm chéo: **6 kv-write + 6 attention
++ 10 conv mỗi step** khớp đúng `layer_types` (6 full_attention + 10 conv). 3691 step đo được.
+
+| Hạng mục | /step | ms/step | % busy |
+| :-- | --: | --: | --: |
+| **attention** (`flash_attn_fwd_sm90` hdim64 + combine) | 19 | **2.75** | **54%** |
+| gemm (w4a8 mixed ×44, lm_head fp8 ×1, cublas ×20) | 65 | 1.874 | 37% |
+| elementwise / norm / act | 124 | 0.375 | 7.4% |
+| conv (`_causal_conv1d_update`) · other | 15.5 | 0.057 | 1.1% |
+| **tổng** | **223.5** | 5.06 busy + 0.36 gap | |
+
+**Bốn câu hỏi của Track A — trả lời hết:**
+1. **223 kernel/step**, không phải 80–100. Nhưng con số này **không quan trọng** (xem 4).
+2. Top kernel: **một kernel duy nhất chiếm 54%** — `flash_attn_fwd_sm90` hdim 64, 6 call/step.
+   GEMM lớn nhất (`w4a8 mixed` tile 128×32×128, 44 call) chỉ 28.6%.
+3. **elementwise/norm/act = 7.4%** dù chiếm **124/223 = 56% số launch** ⇒ fusion gỡ được hơn nửa
+   số kernel nhưng **tối đa 7% thời gian**. Dưới ngưỡng plan (25%) ⇒ **không phải lever**.
+4. **Gap = 4–7%** ⇒ **KHÔNG launch-bound**, cudagraph đang làm đúng việc. Boot log xác nhận
+   `cudagraph_mode=FULL_AND_PIECEWISE`, decode chạy nhánh **FULL** (fact độc lập regime).
+
+**Attention tuyến tính theo context** (2 điểm, mọi hạng mục khác **bất biến** — gemm 1.8746 vs
+1.8749, elementwise 0.375 vs 0.375, đây là chứng cứ nội tại rằng phép đo sạch):
+
+> **t_attn/layer-call = 56 µs + 0.100 µs × context_token**   (ctx 3953 → 452 µs; ctx 7954 → 853 µs)
+
+**Quy về portal:** ở ctx ~3300 (workload thật) ⇒ attention rig = 6×387 µs = **2.32 ms**, phần
+không-attention = **2.31 ms**. Tỉ lệ rig→portal lấy từ nhánh weight (portal 1.20 / rig 1.874 = 0.64)
+⇒ attention portal ≈ **1.5 ms**, tức **~73% của sàn 2.05 ms** và **~46% của TPOT 3.25**.
+⇒ **1.6 ms "chưa giải thích" chính là decode attention.** Không còn ẩn số nào đắt hơn.
+
+**KV fp8 trên rig: chỉ −19% attention, không phải −50%** (385 µs @ctx 4210 so với 478 µs dự đoán
+từ đường bf16; KV pool 1.17M → 2.34M token xác nhận cờ ăn thật, kernel đổi tile 64×192→64×128).
+⇒ **Xác nhận trực tiếp giả thuyết còn sống ở §4.1**: attention bị chặn bởi **độ trễ / số giao dịch
+trên slice ~18 SM**, không phải bề rộng phần tử. Giải thích trọn vẹn vì sao portal đo `k = 1.006`
+và mọi biến thể KV-quant đều không mua được ERS. **Trục KV đóng vĩnh viễn, có cơ chế.**
+
+**Hệ quả — mọi lever "sàn" đã cạn trong phạm vi cờ CLI:**
+- fusion / `enable_noop` / `-O3` ⇒ chạm tối đa 7.4% (§8.3) — **không đáng lượt nộp**.
+- `cudagraph-capture-sizes` dày quanh 24–32 ⇒ vô nghĩa, không launch-bound (§8.4).
+- KV quant mọi dtype ⇒ đã có cơ chế bác bỏ.
+- cascade attention (chia sẻ prefix 1000 tok cho cả batch — ~30% attention) **vẫn đóng**: nguồn
+  0.25.1 cảnh báo *"No piecewise cudagraph for executing cascade attention… fall back to eager"*,
+  trùng khớp `gpu_model_runner.py:3777` ở §4.4 và 22 failed đã đo. Mất cudagraph tốn hơn phần thắng.
+⇒ **80 đòi một attention kernel khác cho shape (B=27, hdim 64, ~18 SM)** — việc build image, không
+phải việc của cờ CLI. Trần cờ-CLI vẫn là **77** (STRATEGY §4), đường đi thực tế là TTFT.
 
 ## 5. ⚠️ Rig H100 (RunPod) SAI regime băng thông
 

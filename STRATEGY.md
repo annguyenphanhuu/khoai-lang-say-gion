@@ -48,11 +48,27 @@ Với K3 (weight 0.734 GB): weight **1.20 ms** + **sàn cố định 2.05 ms** =
 Con số 1.09 GB KV/step là **phép tính**, không phải phép đo — và nó sai.
 
 ⇒ **Cơ cấu thật: sàn 2.05 (61%) · weight 1.20 (36%) · KV ≤0.44 (≤13%).**
-⇒ **~1.6 ms (47% của TPOT) hoàn toàn chưa giải thích được.** Đây là ẩn số đắt nhất còn lại.
-Giả thuyết dẫn đầu: **độ trễ per-kernel × ~80–100 kernel/step trên slice chỉ ~18 SM**. Ở B=27 mọi
-GEMM đều "gầy" (M=27) ⇒ wave quantization + ramp chi phối, không phải throughput. Khớp cả việc
-weight fit đúng băng thông (đọc weight là phần thắng thế của GEMM gầy) lẫn việc có một sàn cố định.
-Kiểm bằng **profiler kernel-level trên rig** (nsys/ncu) — tốn 0 lượt nộp.
+
+### ✅ 2b. SÀN ĐÃ ĐƯỢC ĐỊNH DANH (nsys 27/07, KB §8) — **sàn = decode attention**
+
+Giả thuyết cũ ("latency × 80–100 kernel") **SAI ở phần cơ chế**: có tới **223 kernel/step**, nhưng
+**gap chỉ 4–7%** ⇒ **không launch-bound**. Đo decode thuần B=27 trên rig (MPS 14% ≈ 18 SM):
+
+| | /step | ms/step | % |
+| :-- | --: | --: | --: |
+| **attention** (6 call, `flash_attn_fwd_sm90` hdim64) | 19 | **2.75** | **54%** |
+| gemm | 65 | 1.87 | 37% |
+| elementwise/norm/act | 124 | 0.375 | **7.4%** |
+
+`t_attn/call = 56 µs + 0.100 µs × ctx`. Quy về portal (hệ số 0.64 lấy từ nhánh weight) ở ctx 3300
+⇒ attention ≈ **1.5 ms ≈ 73% của sàn 2.05**. **1.6 ms ẩn số = attention.** Hết ẩn số.
+
+**KV fp8 trên rig chỉ cắt attention 19%** (không phải 50%) ⇒ attention bị chặn bởi **độ trễ / số
+giao dịch trên ~18 SM**, không phải byte. Đây là **cơ chế** giải thích `k=1.006` của §3.1.
+
+⇒ Hệ quả cứng: fusion (≤7.4%), cudagraph-sizes (không launch-bound), KV quant (có cơ chế bác bỏ),
+cascade (mất cudagraph ⇒ eager, §3.2) — **tất cả đều không phải lever**. 80 đòi **kernel attention
+khác cho shape B=27/hdim64/18 SM** = phải build image, không phải cờ CLI.
 
 ## 3. TRỤC ĐÃ ĐÓNG
 
@@ -86,7 +102,9 @@ TPOT hiện tại **3.25**. ⇒ **Trần tuyệt đối của kiến trúc hiệ
 - **75 khả thi**: chỉ cần ttft 54 → ~20 ms, TPOT giữ nguyên.
 - **80 KHÔNG khả thi** nếu không phá sàn 2.05 ms. Weight đã cạn (int4 body + FP8 lm_head;
   lm_head int4 chỉ thêm −0.11 ms = +0.85 ERS, dưới ngưỡng phân giải). KV chỉ còn ≤0.44 ms.
-  ⇒ **80 = crack 1.6 ms sàn chưa giải thích.** Không có đường khác.
+  ⇒ **80 = crack sàn, và sàn = decode attention (§2b).** Không có đường khác — và đường đó
+  **không mở được bằng cờ CLI**, phải thay kernel attention (build image). Trong phạm vi cờ,
+  **77 là trần cứng**; mục tiêu vận hành đúng là **75–77 qua TTFT**.
 
 ## 5. KẾ HOẠCH → `PLAN-2026-07-27.md` (15 lượt, có cổng quyết định)
 
